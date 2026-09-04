@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="760" viewBox="0 0 1320 760" role="img" aria-labelledby="title desc">
+  <title id="title">SGLang DSA eager layer execution timeline</title>
+  <desc id="desc">The eager runner builds attention metadata before model forward. A producer DSA layer then prepares latent vectors, writes the index sidecar and selects top-k pages, before the attention backend writes and reads the main latent cache. A skip-topk layer reuses prior top-k results.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#52606d"/>
+    </marker>
+    <marker id="arrowPurple" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#d97706"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+  </defs>
+
+  <rect width="1320" height="760" fill="#f8fafc"/>
+  <text x="660" y="42" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="25" font-weight="700" fill="#172033">DSA eager layer：metadata 先于模型，sidecar / top-k 先于 main store / read</text>
+  <text x="660" y="70" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="14" font-weight="400" fill="#52606d">图中是依赖顺序；CUDA stream 或 fused kernel 可以重叠实现，但不能打破数据就绪关系</text>
+
+  <line x1="90" y1="116" x2="1230" y2="116" stroke="#cbd5e1" stroke-width="4" marker-end="url(#arrow)"/>
+  <circle cx="140" cy="116" r="12" fill="#64748b"/>
+  <circle cx="380" cy="116" r="12" fill="#2563eb"/>
+  <circle cx="620" cy="116" r="12" fill="#0f766e"/>
+  <circle cx="860" cy="116" r="12" fill="#7c3aed"/>
+  <circle cx="1100" cy="116" r="12" fill="#d97706"/>
+
+  <g filter="url(#shadow)">
+    <rect x="45" y="154" width="190" height="160" rx="14" fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+    <rect x="285" y="154" width="190" height="160" rx="14" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+    <rect x="525" y="154" width="190" height="160" rx="14" fill="#ecfdf5" stroke="#0f766e" stroke-width="2"/>
+    <rect x="765" y="154" width="190" height="160" rx="14" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2"/>
+    <rect x="1005" y="154" width="270" height="160" rx="14" fill="#fff7ed" stroke="#d97706" stroke-width="2"/>
+  </g>
+
+  <text x="140" y="181" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" font-weight="700" fill="#334155">0｜调度 / 分配</text>
+  <text x="62" y="211" font-family="Noto Sans CJK SC" font-size="14" font-weight="400" fill="#334155">补全请求行</text>
+  <text x="62" y="237" font-family="DejaVu Sans Mono, monospace" font-size="13" font-weight="400" fill="#334155">req_to_token</text>
+  <text x="62" y="263" font-family="Noto Sans CJK SC" font-size="14" font-weight="400" fill="#334155">生成本轮新 token 地址</text>
+  <text x="62" y="289" font-family="DejaVu Sans Mono, monospace" font-size="13" font-weight="400" fill="#334155">out_cache_loc</text>
+
+  <text x="380" y="181" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" font-weight="700" fill="#1d4ed8">1｜模型执行前</text>
+  <text x="302" y="211" font-family="DejaVu Sans Mono, monospace" font-size="12" font-weight="400" fill="#1e3a8a">eager_runner</text>
+  <text x="302" y="237" font-family="DejaVu Sans Mono, monospace" font-size="12" font-weight="400" fill="#1e3a8a">init_forward_metadata</text>
+  <text x="302" y="264" font-family="Noto Sans CJK SC" font-size="13" font-weight="400" fill="#1e3a8a">构造逐 token 表与真实页表</text>
+  <text x="302" y="290" font-family="DejaVu Sans Mono, monospace" font-size="12" font-weight="400" fill="#1e3a8a">page_table_1 / real_page_table</text>
+
+  <text x="620" y="181" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" font-weight="700" fill="#0f766e">2｜层内准备</text>
+  <text x="542" y="211" font-family="DejaVu Sans Mono, monospace" font-size="12" font-weight="400" fill="#134e4a">forward_absorb_prepare</text>
+  <text x="542" y="239" font-family="Noto Sans CJK SC" font-size="13" font-weight="400" fill="#134e4a">计算当前 token 的</text>
+  <text x="542" y="266" font-family="DejaVu Sans Mono, monospace" font-size="13" font-weight="400" fill="#134e4a">q_lora, k_nope, k_pe</text>
+  <text x="542" y="292" font-family="Noto Sans CJK SC" font-size="13" font-weight="400" fill="#134e4a">尚未写 main latent cache</text>
+
+  <text x="860" y="181" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" font-weight="700" fill="#6d28d9">3｜Indexer（生产层）</text>
+  <text x="782" y="211" font-family="Noto Sans CJK SC" font-size="13" font-weight="400" fill="#5b21b6">按同一 out_cache_loc</text>
+  <text x="782" y="238" font-family="Noto Sans CJK SC" font-size="13" font-weight="700" fill="#5b21b6">写 index sidecar</text>
+  <text x="782" y="266" font-family="Noto Sans CJK SC" font-size="13" font-weight="400" fill="#5b21b6">打分并选 top-k</text>
+  <text x="782" y="292" font-family="Noto Sans CJK SC" font-size="13" font-weight="400" fill="#5b21b6">必要时转换结果表示</text>
+
+  <text x="1140" y="181" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16" font-weight="700" fill="#b45309">4｜Attention backend</text>
+  <text x="1022" y="211" font-family="DejaVu Sans Mono, monospace" font-size="12" font-weight="400" fill="#92400e">forward_absorb_core</text>
+  <text x="1022" y="237" font-family="Noto Sans CJK SC" font-size="13" font-weight="700" fill="#92400e">写 main latent cache</text>
+  <text x="1022" y="264" font-family="Noto Sans CJK SC" font-size="13" font-weight="400" fill="#92400e">完成 top-k 表示转换（若需要）</text>
+  <text x="1022" y="290" font-family="Noto Sans CJK SC" font-size="13" font-weight="400" fill="#92400e">按候选 loc 稀疏读取 main</text>
+
+  <line x1="235" y1="234" x2="278" y2="234" stroke="#52606d" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="475" y1="234" x2="518" y2="234" stroke="#52606d" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="715" y1="234" x2="758" y2="234" stroke="#7c3aed" stroke-width="2" marker-end="url(#arrowPurple)"/>
+  <line x1="955" y1="234" x2="998" y2="234" stroke="#d97706" stroke-width="2" marker-end="url(#arrowOrange)"/>
+
+  <rect x="95" y="362" width="1130" height="128" rx="16" fill="#ffffff" stroke="#d8dee9" stroke-width="2"/>
+  <text x="125" y="394" font-family="Noto Sans CJK SC" font-size="16" font-weight="700" fill="#172033">最小正确性约束</text>
+  <rect x="125" y="417" width="314" height="48" rx="9" fill="#f5f3ff" stroke="#8b5cf6"/>
+  <text x="282" y="438" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="13" font-weight="700" fill="#5b21b6">sidecar[loc] 已就绪</text>
+  <text x="282" y="456" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="12" font-weight="400" fill="#5b21b6">才能用它为历史 token 打分</text>
+  <line x1="445" y1="441" x2="490" y2="441" stroke="#52606d" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="500" y="417" width="314" height="48" rx="9" fill="#f1f5f9" stroke="#64748b"/>
+  <text x="657" y="438" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="13" font-weight="700" fill="#334155">top-k 候选 loc 已确定</text>
+  <text x="657" y="456" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="12" font-weight="400" fill="#475569">表示可由 indexer 或 backend 转换</text>
+  <line x1="820" y1="441" x2="865" y2="441" stroke="#52606d" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="875" y="417" width="314" height="48" rx="9" fill="#fff7ed" stroke="#f59e0b"/>
+  <text x="1032" y="438" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="13" font-weight="700" fill="#92400e">main[loc] 已就绪</text>
+  <text x="1032" y="456" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="12" font-weight="400" fill="#92400e">才能按候选 loc 读取 latent</text>
+
+  <rect x="95" y="526" width="1130" height="112" rx="16" fill="#f8fafc" stroke="#64748b" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="125" y="560" font-family="Noto Sans CJK SC" font-size="16" font-weight="700" fill="#334155">skip_topk 层的分支</text>
+  <text x="125" y="589" font-family="Noto Sans CJK SC" font-size="14" font-weight="400" fill="#475569">该层的 IndexKeyCache 是 0-row 占位，不写自己的 sidecar，也不重新选 top-k；复用前一个生产层的 top-k。</text>
+  <text x="125" y="616" font-family="Noto Sans CJK SC" font-size="14" font-weight="400" fill="#475569">它仍按本层的 out_cache_loc 写 main latent cache，并用复用的候选地址完成 sparse attention。</text>
+
+  <rect x="95" y="675" width="20" height="20" rx="4" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="125" y="691" font-family="Noto Sans CJK SC" font-size="13" font-weight="400" fill="#334155">metadata / 地址映射</text>
+  <rect x="340" y="675" width="20" height="20" rx="4" fill="#f5f3ff" stroke="#7c3aed"/>
+  <text x="370" y="691" font-family="Noto Sans CJK SC" font-size="13" font-weight="400" fill="#334155">index sidecar / top-k</text>
+  <rect x="610" y="675" width="20" height="20" rx="4" fill="#fff7ed" stroke="#d97706"/>
+  <text x="640" y="691" font-family="Noto Sans CJK SC" font-size="13" font-weight="400" fill="#334155">main latent cache</text>
+  <text x="1195" y="691" text-anchor="end" font-family="DejaVu Sans Mono, monospace" font-size="12" font-weight="400" fill="#64748b">same loc, distinct payloads</text>
+</svg>

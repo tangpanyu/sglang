@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="650" viewBox="0 0 1200 650" role="img" aria-labelledby="title desc">
+  <title id="title">SGLang request row, radix tree and KV slot mapping</title>
+  <desc id="desc">Request A writes slots 1 through 37. The radix tree stores a copy of those slot IDs. Request B reuses the prefix and writes only slot 38.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+    <style>
+      .title { font-family: "Noto Sans CJK SC"; font-size: 25px; font-weight: 700; fill: #0f172a; }
+      .label { font-family: "Noto Sans CJK SC"; font-size: 17px; font-weight: 600; fill: #0f172a; }
+      .text { font-family: "Noto Sans CJK SC"; font-size: 15px; fill: #334155; }
+      .mono { font-family: "DejaVu Sans Mono"; font-size: 14px; fill: #0f172a; }
+      .small { font-family: "Noto Sans CJK SC"; font-size: 13px; fill: #475569; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="650" fill="#f8fafc"/>
+  <text x="40" y="45" class="title">SGLang：slot-ID 在 request row、radix tree 与 K/V pool 之间的流动</text>
+  <text x="40" y="72" class="text">示例为 page_size=1；树保存 slot 向量的 clone，K/V 数值仍只在各层 pool。</text>
+
+  <rect x="40" y="105" width="350" height="205" rx="12" fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+  <text x="62" y="137" class="label">A 的 request row：r=5</text>
+  <text x="62" y="165" class="mono">req_to_token[5, 0:37]</text>
+  <rect x="62" y="183" width="305" height="44" rx="7" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="77" y="211" class="mono">[1, 2, 3, …, 36, 37]</text>
+  <text x="62" y="256" class="small">row 是 int32 映射表中的一行，不是 K/V bytes。</text>
+  <text x="62" y="280" class="small">完成后 row 5 可归还；slot owner 仍在树。</text>
+
+  <rect x="445" y="105" width="325" height="205" rx="12" fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+  <text x="467" y="137" class="label">UnifiedRadixCache / FULL</text>
+  <text x="467" y="165" class="mono">node.value = clone([1, …, 37])</text>
+  <rect x="467" y="183" width="281" height="44" rx="7" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="483" y="211" class="mono">cached prefix slots</text>
+  <text x="467" y="256" class="small">NodeId、lock 和 eviction 在这一层。</text>
+  <text x="467" y="280" class="small">match 只返回 slot IDs，不复制 K/V 数值。</text>
+
+  <rect x="825" y="105" width="335" height="205" rx="12" fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+  <text x="847" y="137" class="label">B 的 request row：r=6</text>
+  <text x="847" y="165" class="mono">req_to_token[6, 0:38]</text>
+  <rect x="847" y="183" width="291" height="44" rx="7" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="860" y="211" class="mono">[1, …, 37]</text>
+  <rect x="1040" y="183" width="98" height="44" rx="7" fill="#ffedd5" stroke="#fb923c"/>
+  <text x="1055" y="211" class="mono">38</text>
+  <text x="847" y="256" class="small">B 命中 37-token prefix，只申请 slot 38。</text>
+  <text x="847" y="280" class="small">cache_protected_len=37。</text>
+
+  <line x1="390" y1="205" x2="445" y2="205" stroke="#334155" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="390" y="190" class="small">finish: copy IDs</text>
+  <line x1="770" y1="205" x2="825" y2="205" stroke="#334155" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="771" y="190" class="small">match: reuse IDs</text>
+
+  <rect x="40" y="365" width="1120" height="205" rx="12" fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+  <text x="62" y="400" class="label">MHATokenToKVPool（每个 local layer 各一对 buffer）</text>
+  <text x="62" y="427" class="mono">K[layer], V[layer] : [size + 1, Hkv_local, D]   （NHD，page_size=1）</text>
+
+  <rect x="62" y="452" width="670" height="52" rx="8" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="82" y="485" class="mono">slot 1 … slot 37  ← A 的 37 个 token；B 直接读同一批 slot</text>
+  <rect x="752" y="452" width="170" height="52" rx="8" fill="#ffedd5" stroke="#fb923c"/>
+  <text x="784" y="485" class="mono">slot 38 ← B</text>
+  <rect x="942" y="452" width="180" height="52" rx="8" fill="#e2e8f0" stroke="#94a3b8"/>
+  <text x="976" y="485" class="mono">slot 0 dummy</text>
+  <text x="62" y="540" class="small">attention backend 通过 req_to_token 和 ForwardBatch metadata 读这些位置；tree node 不存 K/V tensor。</text>
+
+  <line x1="220" y1="310" x2="270" y2="365" stroke="#334155" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="116" y="344" class="small">set_kv_buffer</text>
+  <line x1="990" y1="310" x2="865" y2="365" stroke="#334155" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="955" y="344" class="small">只写新增 38</text>
+
+  <rect x="40" y="600" width="20" height="20" rx="4" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="70" y="616" class="small">已有/共享 slot-ID</text>
+  <rect x="235" y="600" width="20" height="20" rx="4" fill="#ffedd5" stroke="#fb923c"/>
+  <text x="265" y="616" class="small">本轮新写 slot</text>
+  <rect x="430" y="600" width="20" height="20" rx="4" fill="#e2e8f0" stroke="#94a3b8"/>
+  <text x="460" y="616" class="small">保留的 dummy/metadata</text>
+</svg>

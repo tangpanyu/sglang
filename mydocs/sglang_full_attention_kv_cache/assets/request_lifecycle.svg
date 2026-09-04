@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="790" viewBox="0 0 1400 790" role="img" aria-labelledby="title desc">
+  <title id="title">SGLang request lifecycle for a prefix hit</title>
+  <desc id="desc">Request B matches a 37-token prefix, locks it, allocates slot 38, writes and reads K/V, then finishes or is released under pressure.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+    <marker id="redArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#dc2626"/>
+    </marker>
+    <marker id="greenArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#15803d"/>
+    </marker>
+    <style>
+      .title { font-family: "Noto Sans CJK SC"; font-size: 26px; font-weight: 700; fill: #0f172a; }
+      .section { font-family: "Noto Sans CJK SC"; font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .num { font-family: "DejaVu Sans Mono"; font-size: 19px; font-weight: 700; fill: #1d4ed8; }
+      .label { font-family: "Noto Sans CJK SC"; font-size: 15px; font-weight: 600; fill: #0f172a; }
+      .text { font-family: "Noto Sans CJK SC"; font-size: 13px; fill: #334155; }
+      .small { font-family: "Noto Sans CJK SC"; font-size: 12px; fill: #475569; }
+      .mono { font-family: "DejaVu Sans Mono"; font-size: 12px; fill: #0f172a; }
+    </style>
+  </defs>
+
+  <rect width="1400" height="790" fill="#f8fafc"/>
+  <text x="40" y="44" class="title">请求 B 的生命周期：prefix hit 之后，slot 38 怎样走到回收</text>
+  <text x="40" y="70" class="text">固定示例：A 已缓存 [1…37]；B 命中 37 个 token，新增 b37，只写一个 slot。</text>
+
+  <text x="40" y="112" class="section">正常路径（从 waiting 到 finish）</text>
+  <line x1="96" y1="168" x2="1318" y2="168" stroke="#94a3b8" stroke-width="3"/>
+
+  <circle cx="96" cy="168" r="20" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="89" y="175" class="num">1</text>
+  <rect x="40" y="204" width="190" height="178" rx="11" fill="#ffffff" stroke="#60a5fa" stroke-width="2"/>
+  <text x="58" y="232" class="label">Req.init_next_round_input</text>
+  <text x="58" y="264" class="mono">key_limit = 38 - 1 = 37</text>
+  <text x="58" y="291" class="text">match_prefix()</text>
+  <rect x="58" y="309" width="154" height="31" rx="6" fill="#dbeafe"/>
+  <text x="69" y="330" class="mono">prefix=[1…37]</text>
+  <text x="58" y="363" class="small">返回 NodeId + device_indices</text>
+
+  <circle cx="340" cy="168" r="20" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="333" y="175" class="num">2</text>
+  <rect x="284" y="204" width="190" height="178" rx="11" fill="#ffffff" stroke="#60a5fa" stroke-width="2"/>
+  <text x="302" y="232" class="label">PrefillAdder.add_one_req</text>
+  <text x="302" y="264" class="text">接受 B 进入 batch</text>
+  <rect x="302" y="282" width="154" height="31" rx="6" fill="#dbeafe"/>
+  <text x="313" y="303" class="mono">lock(NodeId)</text>
+  <text x="302" y="336" class="mono">cache_protected_len=37</text>
+  <text x="302" y="363" class="small">match 本身不加锁；准入时才保护</text>
+
+  <circle cx="584" cy="168" r="20" fill="#ffedd5" stroke="#ea580c" stroke-width="2"/>
+  <text x="577" y="175" class="num">3</text>
+  <rect x="528" y="204" width="190" height="178" rx="11" fill="#ffffff" stroke="#fb923c" stroke-width="2"/>
+  <text x="546" y="232" class="label">alloc_for_extend</text>
+  <text x="546" y="264" class="mono">row r=6</text>
+  <rect x="546" y="282" width="154" height="31" rx="6" fill="#ffedd5"/>
+  <text x="557" y="303" class="mono">out_cache_loc=[38]</text>
+  <text x="546" y="336" class="mono">req_to_token[6,:]</text>
+  <text x="546" y="358" class="mono">=[1…37,38]</text>
+
+  <circle cx="828" cy="168" r="20" fill="#ffedd5" stroke="#ea580c" stroke-width="2"/>
+  <text x="821" y="175" class="num">4</text>
+  <rect x="772" y="204" width="190" height="178" rx="11" fill="#ffffff" stroke="#fb923c" stroke-width="2"/>
+  <text x="790" y="232" class="label">ForwardBatch + backend</text>
+  <text x="790" y="264" class="text">先写本轮新增 K/V</text>
+  <rect x="790" y="282" width="154" height="31" rx="6" fill="#ffedd5"/>
+  <text x="801" y="303" class="mono">set_kv_buffer(38)</text>
+  <text x="790" y="336" class="text">再按 row 读完整上下文</text>
+  <text x="790" y="361" class="mono">read slots [1…38]</text>
+
+  <circle cx="1072" cy="168" r="20" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+  <text x="1065" y="175" class="num">5</text>
+  <rect x="1016" y="204" width="190" height="178" rx="11" fill="#ffffff" stroke="#4ade80" stroke-width="2"/>
+  <text x="1034" y="232" class="label">release_kv_cache</text>
+  <text x="1034" y="264" class="mono">is_insert=True</text>
+  <rect x="1034" y="282" width="154" height="31" rx="6" fill="#dcfce7"/>
+  <text x="1045" y="303" class="mono">FULL.value=clone</text>
+  <text x="1034" y="336" class="text">树接管 slot-ID 副本</text>
+  <text x="1034" y="361" class="small">row 6 可 free；slot 暂不回 free-list</text>
+
+  <line x1="116" y1="168" x2="320" y2="168" stroke="#334155" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <line x1="360" y1="168" x2="564" y2="168" stroke="#334155" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <line x1="604" y1="168" x2="808" y2="168" stroke="#334155" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <line x1="848" y1="168" x2="1052" y2="168" stroke="#334155" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="430" width="1160" height="126" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="62" y="460" class="section">状态与 owner 的变化</text>
+  <rect x="62" y="480" width="300" height="48" rx="7" fill="#dbeafe"/>
+  <text x="78" y="509" class="mono">树持有 [1…37]；B 尚无 row</text>
+  <line x1="362" y1="504" x2="402" y2="504" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="407" y="480" width="325" height="48" rx="7" fill="#ffedd5"/>
+  <text x="423" y="509" class="mono">B row=6 → [1…37,38]；pool 写 38</text>
+  <line x1="732" y1="504" x2="772" y2="504" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="777" y="480" width="395" height="48" rx="7" fill="#dcfce7"/>
+  <text x="793" y="509" class="mono">树 clone [1…38]；row free；slot 等待 eviction</text>
+
+  <text x="40" y="603" class="section">两个容易混淆的旁路</text>
+  <rect x="40" y="625" width="560" height="111" rx="11" fill="#fff1f2" stroke="#f87171" stroke-width="2"/>
+  <text x="62" y="654" class="label">显存不足：evict_for_alloc()</text>
+  <text x="62" y="681" class="text">只淘汰 lock=0 的缓存节点，把其 slot/page 交回 allocator。</text>
+  <text x="62" y="706" class="small">固定 K/V backing 不缩容；这是 cache eviction。</text>
+  <line x1="600" y1="680" x2="645" y2="680" stroke="#dc2626" stroke-width="2.5" stroke-dasharray="7 5" marker-end="url(#redArrow)"/>
+  <rect x="652" y="625" width="548" height="111" rx="11" fill="#fef2f2" stroke="#f87171" stroke-width="2"/>
+  <text x="674" y="654" class="label">运行请求撤回：release_req()</text>
+  <text x="674" y="681" class="text">走 release_kv_cache(is_insert=False)，可 backup/requeue。</text>
+  <text x="674" y="706" class="small">不新增 tree entry；这是 request lifecycle，不是 eviction。</text>
+
+  <rect x="1220" y="430" width="120" height="126" rx="10" fill="#e2e8f0"/>
+  <text x="1238" y="458" class="small">颜色</text>
+  <rect x="1238" y="474" width="16" height="16" rx="3" fill="#dbeafe"/>
+  <text x="1262" y="487" class="small">复用</text>
+  <rect x="1238" y="500" width="16" height="16" rx="3" fill="#ffedd5"/>
+  <text x="1262" y="513" class="small">新写</text>
+  <rect x="1238" y="526" width="16" height="16" rx="3" fill="#dcfce7"/>
+  <text x="1262" y="539" class="small">完成</text>
+</svg>
