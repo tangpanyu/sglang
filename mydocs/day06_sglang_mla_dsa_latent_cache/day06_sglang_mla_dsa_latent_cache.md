@@ -34,18 +34,29 @@ Day06 不重新讲 row/slot 是怎样分配的，只追一个新问题：
 完整调用顺序先看一行：
 
 ~~~text
-ModelRunner.alloc_memory_pool()
-→ DefaultPoolConfigurator 计算 bytes/token
-→ KVCacheConfigurator 选择 MLA/DSA pool 与 paged allocator
-→ UnifiedRadixCache.match_prefix() 返回 prefix locs
-→ PrefillAdder 准入后加锁
-→ alloc_for_extend/decode 写完整 request row
-→ attention backend 在模型前构造 DSAMetadata
-→ forward_mla 产生 k_nope / k_rope
-→ producer layer 的 Indexer 写 sidecar、打分并选择 top-k
-→ RadixAttention / DSA backend 写 main latent、读取候选 latent
-→ release_kv_cache() 完成缓存；短缺时 evict_for_alloc()
+Scheduler.__init__
+├─ init_model_worker()
+│  └─ init_memory_pools()
+│     └─ init_target_memory_pool()
+│        └─ tp_worker.alloc_memory_pool()
+│           └─ model_runner.alloc_memory_pool()
+│              └─ KVCacheConfigurator.configure()
+│                 └─ _init_pools()
+│                    ├─ request-to-token pool
+│                    ├─ MLA/DSA token-to-KV pool
+│                    └─ paged token allocator
+└─ build_kv_cache()
+   └─ create_tree_cache() → UnifiedRadixCache
+
+请求阶段（建池完成之后）：
+match_prefix() → PrefillAdder 加锁 → alloc_for_extend/decode
+→ 写完整 request row → attention backend 构造 metadata
+→ forward_mla / Indexer 写 main latent 与 sidecar
+→ top-k 选择候选 loc → DSA backend 读取候选 latent
+→ release_kv_cache()；短缺时 evict_for_alloc()
 ~~~
+
+这张图中的第一部分是初始化的真实入口，第二部分才是请求到来后的数据流。本文关闭 speculative decoding，因此只展开 `tp_worker`；如果代码中出现 `draft_worker`，先把它视为被 `if self.draft_worker is not None` 包住的另一条可选分支。`configure()` 下面的 pool 名称是函数内部创建并返回的对象，不是 `configure()` 返回后还会再调用的函数。
 
 ## 1. 从 Day05 到 Day06：地址层不变，physical payload 改变
 
@@ -73,7 +84,11 @@ $$
 
 ### 2.1 pool 与 allocator 的真实选择
 
-启动入口仍从 [`ModelRunner.alloc_memory_pool()` · L881–L907](../../python/sglang/srt/model_executor/model_runner.py#881-907) 进入 [`KVCacheConfigurator.configure()` · L296–L329](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#296-329)。本文范围内的选择可压缩为：
+从 scheduler 进入 pool 的路径不要直接从 `ModelRunner` 开始猜。当前文件中的逐跳入口是：[`Scheduler.__init__` 调用 `init_model_worker()` 和 `build_kv_cache()` · L553–L559](../../python/sglang/srt/managers/scheduler.py#553-559) → [`init_memory_pools()` · L1020–L1038](../../python/sglang/srt/managers/scheduler.py#1020-1038) → [`init_target_memory_pool()` · L1006–L1018](../../python/sglang/srt/managers/scheduler.py#1006-1018) → [`TpModelWorker.alloc_memory_pool()` · L407–L433](../../python/sglang/srt/managers/tp_worker.py#407-433) → [`ModelRunner.alloc_memory_pool()` · L881–L903](../../python/sglang/srt/model_executor/model_runner.py#881-903) → [`KVCacheConfigurator.configure()` · L296–L329](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#296-329)。
+
+在 `configure()` 内部，继续进入 [`_init_pools()` · L397–L510](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#397-510)；DSA 分支再进入 [`_build_dsa_kv_pool()` · L1489–L1516](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1489-1516)，allocator 则由 [`_build_token_to_kv_pool_allocator()` · L1832–L1959](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1832-1959) 选择。`ModelRunner.alloc_memory_pool()` 返回后，才经 [`_init_post_memory_pool_components()` · L904–L934](../../python/sglang/srt/model_executor/model_runner.py#904-934) 做 [`init_kv_index_translator()` · L869–L879](../../python/sglang/srt/model_executor/model_runner.py#869-879) 的后置接线。
+
+因此，本文范围内的启动选择可压缩为：
 
 ~~~text
 use_mla_backend = True
@@ -458,15 +473,17 @@ allocator 短缺时，[`evict_from_tree_cache()` · L168–L194](../../python/sg
 
 | 顺序 | 文件 | 先找什么 | 读完应得到什么 |
 |---:|---|---|---|
-| 1 | `model_runner.py` | [`alloc_memory_pool()` · L881–L907](../../python/sglang/srt/model_executor/model_runner.py#881-907) | pool 初始化发生在 backend/请求之前 |
-| 2 | `pool_configurator.py` | [`_compute_cell_size()` · L248–L362](../../python/sglang/srt/model_executor/pool_configurator.py#248-362)、[`_compute_dsa_indexer_cell_size()` · L364–L426](../../python/sglang/srt/model_executor/pool_configurator.py#364-426) | main 与 sidecar 怎样共同决定 capacity |
-| 3 | `kv_cache_configurator.py` | [`_build_token_to_kv_pool()` · L1125–L1245](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1125-1245)、[`_build_dsa_kv_pool()` · L1489–L1541](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1489-1541)、[`_build_token_to_kv_pool_allocator()` · L1832–L1945](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1832-1945) | MLA/DSA/paged allocator 的分流 |
-| 4 | `memory_pool.py` | [`MLATokenToKVPool` · L3970–L4239](../../python/sglang/srt/mem_cache/memory_pool.py#3970-4239)、[`DSATokenToKVPool` · L4421–L4569](../../python/sglang/srt/mem_cache/memory_pool.py#4421-4569) | main row shape、setter、同址 facade |
-| 5 | `index_key_cache.py` / `index_buf_accessor.py` | [`_buffer_shape()`、`store_quantized()` · L14–L160](../../python/sglang/srt/mem_cache/index_key_cache.py#14-160)、[`SetKAndS` · L259–L276](../../python/sglang/kernels/ops/attention/dsa/index_buf_accessor.py#259-276) | sidecar 的真实 page-major bytes |
-| 6 | `allocation.py` / `forward_batch_info.py` | [`write_cache_indices()` · L54–L103](../../python/sglang/srt/mem_cache/allocation.py#54-103)、[`ForwardBatch` · L394–L411](../../python/sglang/srt/model_executor/forward_batch_info.py#394-411)、[`init_new()` · L723–L800](../../python/sglang/srt/model_executor/forward_batch_info.py#723-800) | 完整 read row 与本轮 write loc |
-| 7 | `eager_runner.py` / `dsa_backend.py` | [`_execute_decode/extend()` · L243–L378](../../python/sglang/srt/model_executor/runner/eager_runner.py#243-378)、[`init_forward_metadata()` · L777–L1076](../../python/sglang/srt/layers/attention/dsa_backend.py#777-1076)、[`_transform_table_1_to_real()` · L748–L756](../../python/sglang/srt/layers/attention/dsa_backend.py#748-756) | 两张 page table 在何时产生 |
-| 8 | `forward_mla.py` / `dsa_indexer.py` | [`forward_absorb_prepare/core` · L279–L926](../../python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py#279-926)、[`_store_index_k_cache()` · L1471–L1552](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1471-1552) | sidecar → top-k → main store/read 顺序 |
-| 9 | `registry.py` / `unified_radix_cache.py` / `full_component.py` | [`default_radix_cache_factory()` · L80–L143](../../python/sglang/srt/mem_cache/registry.py#80-143)、[`cache_finished_req()` · L838–L924](../../python/sglang/srt/mem_cache/unified_radix_cache.py#838-924)、[`evict_for_alloc()` · L566–L639](../../python/sglang/srt/mem_cache/unified_radix_cache.py#566-639)、[FullComponent lock/evict · L160–L344](../../python/sglang/srt/mem_cache/unified_cache/components/full_component.py#160-344) | loc clone、锁、finish 和 eviction |
+| 1 | `scheduler.py` | [`Scheduler.__init__` 中的调用 · L553–L559](../../python/sglang/srt/managers/scheduler.py#553-559)、[`init_memory_pools()` · L1020–L1038](../../python/sglang/srt/managers/scheduler.py#1020-1038)、[`init_target_memory_pool()` · L1006–L1018](../../python/sglang/srt/managers/scheduler.py#1006-1018) | 找到 target pool 初始化的真正入口，不把 `init_memory_pools()` 误认为直接调用 worker |
+| 2 | `tp_worker.py` | [`alloc_memory_pool()` · L407–L433](../../python/sglang/srt/managers/tp_worker.py#407-433) | 明白 worker 只是把 pool 初始化转交给 `model_runner` |
+| 3 | `model_runner.py` | [`alloc_memory_pool()` · L881–L903](../../python/sglang/srt/model_executor/model_runner.py#881-903) | pool 初始化发生在 backend/请求之前 |
+| 4 | `pool_configurator.py` | [`_compute_cell_size()` · L248–L362](../../python/sglang/srt/model_executor/pool_configurator.py#248-362)、[`_compute_dsa_indexer_cell_size()` · L364–L426](../../python/sglang/srt/model_executor/pool_configurator.py#364-426) | main 与 sidecar 怎样共同决定 capacity |
+| 5 | `kv_cache_configurator.py` | [`_build_token_to_kv_pool()` · L1125–L1245](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1125-1245)、[`_build_dsa_kv_pool()` · L1489–L1541](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1489-1541)、[`_build_token_to_kv_pool_allocator()` · L1832–L1945](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1832-1945) | MLA/DSA/paged allocator 的分流 |
+| 6 | `memory_pool.py` | [`MLATokenToKVPool` · L3970–L4239](../../python/sglang/srt/mem_cache/memory_pool.py#3970-4239)、[`DSATokenToKVPool` · L4421–L4569](../../python/sglang/srt/mem_cache/memory_pool.py#4421-4569) | main row shape、setter、同址 facade |
+| 7 | `index_key_cache.py` / `index_buf_accessor.py` | [`_buffer_shape()`、`store_quantized()` · L14–L160](../../python/sglang/srt/mem_cache/index_key_cache.py#14-160)、[`SetKAndS` · L259–L276](../../python/sglang/kernels/ops/attention/dsa/index_buf_accessor.py#259-276) | sidecar 的真实 page-major bytes |
+| 8 | `allocation.py` / `forward_batch_info.py` | [`write_cache_indices()` · L54–L103](../../python/sglang/srt/mem_cache/allocation.py#54-103)、[`ForwardBatch` · L394–L411](../../python/sglang/srt/model_executor/forward_batch_info.py#394-411)、[`init_new()` · L723–L800](../../python/sglang/srt/model_executor/forward_batch_info.py#723-800) | 完整 read row 与本轮 write loc |
+| 9 | `eager_runner.py` / `dsa_backend.py` | [`_execute_decode/extend()` · L243–L378](../../python/sglang/srt/model_executor/runner/eager_runner.py#243-378)、[`init_forward_metadata()` · L777–L1076](../../python/sglang/srt/layers/attention/dsa_backend.py#777-1076)、[`_transform_table_1_to_real()` · L748–L756](../../python/sglang/srt/layers/attention/dsa_backend.py#748-756) | 两张 page table 在何时产生 |
+| 10 | `forward_mla.py` / `dsa_indexer.py` | [`forward_absorb_prepare/core` · L279–L926](../../python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py#279-926)、[`_store_index_k_cache()` · L1471–L1552](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1471-1552) | sidecar → top-k → main store/read 顺序 |
+| 11 | `registry.py` / `unified_radix_cache.py` / `full_component.py` | [`default_radix_cache_factory()` · L80–L143](../../python/sglang/srt/mem_cache/registry.py#80-143)、[`cache_finished_req()` · L838–L924](../../python/sglang/srt/mem_cache/unified_radix_cache.py#838-924)、[`evict_for_alloc()` · L566–L639](../../python/sglang/srt/mem_cache/unified_radix_cache.py#566-639)、[FullComponent lock/evict · L160–L344](../../python/sglang/srt/mem_cache/unified_cache/components/full_component.py#160-344) | loc clone、锁、finish 和 eviction |
 
 旧版 [`RadixCache` · L303–L863](../../python/sglang/srt/mem_cache/radix_cache.py#303-863) 的实现较短，可辅助理解 [`RadixKey.page_aligned` · L150–L154](../../python/sglang/srt/mem_cache/radix_cache.py#150-154) 和经典接口；但当前默认对象、NodeId、component lock 与 eviction 行为必须以上表第 9 行为准。
 

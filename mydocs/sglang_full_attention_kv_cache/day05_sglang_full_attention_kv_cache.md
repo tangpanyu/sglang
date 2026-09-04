@@ -27,6 +27,8 @@
 → 显存不足时淘汰未锁定前缀并复用 slot
 ~~~
 
+上面这行是“请求如何经过各层”的概念链，不是初始化函数的逐行调用图。读源码时要把两种箭头分开：`→` 表示实际函数调用；缩进下面的对象表示上层函数内部创建或返回的结果。特别是，`init_memory_pools()` 不会直接调用 `TpModelWorker.alloc_memory_pool()`，中间还有一个 target-only helper：`init_target_memory_pool()`。
+
 ## 0. 先锁定阅读假设和术语
 
 ### 0.1 本课范围
@@ -66,30 +68,43 @@
 
 ### 1.1 从 Scheduler 追到三个池
 
-SGLang 的启动顺序不是“请求来了才创建一张 block table”。可以从 [`Scheduler.init_model_worker()` · L1047–L1060](../../python/sglang/srt/managers/scheduler.py#1047-1060) 往下读：
+SGLang 的启动顺序不是“请求来了才创建一张 block table”。这里先给出可逐跳跟进的真实调用关系；本文固定 `speculative_algorithm=None`，所以只展开 target worker 分支：
 
 ~~~text
-Scheduler
-  → init_model_worker()
-    → init_memory_pools()
-      → TpModelWorker.alloc_memory_pool()
-        → ModelRunner.alloc_memory_pool()
-          → KVCacheConfigurator.configure()
-            → ReqToTokenPool
-            → MHATokenToKVPool
-            → TokenToKVPoolAllocator / PagedTokenToKVPoolAllocator
-          → ModelRunner.init_kv_index_translator()
-    → init_all_attention_backends()
-  → kv_cache_builder.build_kv_cache()
-    → CacheInitParams
-    → registry.create_tree_cache()
-      → UnifiedRadixCache(params)
+Scheduler.__init__
+├─ self.init_model_worker()                         # scheduler.py:553
+│  ├─ init_tp_model_worker()
+│  │  └─ self.tp_worker = TpModelWorker(...)
+│  ├─ maybe_init_draft_worker()
+│  │  └─ self.draft_worker = None  # speculative disabled
+│  ├─ init_memory_pools()
+│  │  └─ init_target_memory_pool()
+│  │     └─ self.tp_worker.alloc_memory_pool()
+│  │        └─ self.model_runner.alloc_memory_pool()
+│  │           ├─ init_kv_cache_configurator()
+│  │           ├─ kv_cache_configurator.configure()
+│  │           │  └─ _init_pools()
+│  │           │     ├─ ReqToTokenPool
+│  │           │     ├─ MHATokenToKVPool
+│  │           │     └─ TokenToKVPoolAllocator / PagedTokenToKVPoolAllocator
+│  │           └─ _init_post_memory_pool_components()
+│  │              └─ init_kv_index_translator()
+│  ├─ init_all_attention_backends()
+│  └─ init_all_cuda_graphs()
+└─ kv_cache_builder.build_kv_cache()                 # scheduler.py:559
+   ├─ params = CacheInitParams(...)
+   └─ create_tree_cache(...)
+      └─ registry.create_tree_cache(...)
 ~~~
+
+按当前文件实际跳转时，光标在 `self.init_target_memory_pool()` 后依次进入 [`init_target_memory_pool()` · L1006–L1018](../../python/sglang/srt/managers/scheduler.py#1006-1018)、[`TpModelWorker.alloc_memory_pool()` · L407–L433](../../python/sglang/srt/managers/tp_worker.py#407-433)、[`ModelRunner.alloc_memory_pool()` · L881–L903](../../python/sglang/srt/model_executor/model_runner.py#881-903)，再进入 [`KVCacheConfigurator.configure()` · L296–L329](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#296-329)。`configure()` 通过 [`_init_pools()` · L397–L510](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#397-510) 创建并返回三个 pool/allocator 对象；它们不是 `configure()` 后面的同名函数调用。
+
+`ModelRunner.init_kv_index_translator()` 也不是和 `configure()` 同一层的并列步骤，而是 `alloc_memory_pool()` 返回结果后，经 [`_init_post_memory_pool_components()` · L904–L934](../../python/sglang/srt/model_executor/model_runner.py#904-934) 做的后置接线。最后，`build_kv_cache()` 是 `Scheduler.__init__` 在 `init_model_worker()` 返回之后的下一阶段，不在 `init_memory_pools()` 内部。
 
 对应源码入口（均为当前基线行号）：
 
-- worker 调用链见 [`init_memory_pools()` · L1020–L1033](../../python/sglang/srt/managers/scheduler.py#1020-1033)、[`init_model_worker()` · L1047–L1060](../../python/sglang/srt/managers/scheduler.py#1047-1060)，以及 [`TpModelWorker.alloc_memory_pool()` · L407–L433](../../python/sglang/srt/managers/tp_worker.py#407-433)；
-- 池的选择见 [`KVCacheConfigurator.configure()` · L296–L329](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#296-329)、[`_build_req_to_token_pool()` · L938–L966](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#938-966) 和 MHA pool/allocator 的两个构造入口（[L1796–L1830](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1796-1830)、[L1832–L1945](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1832-1945)）；
+- Scheduler 的外层顺序见 [`Scheduler.__init__` 中的调用 · L553–L559](../../python/sglang/srt/managers/scheduler.py#553-559)；worker 调用链见 [`init_memory_pools()` · L1020–L1038](../../python/sglang/srt/managers/scheduler.py#1020-1038)、[`init_target_memory_pool()` · L1006–L1018](../../python/sglang/srt/managers/scheduler.py#1006-1018)、[`init_model_worker()` · L1047–L1060](../../python/sglang/srt/managers/scheduler.py#1047-1060)，以及 [`TpModelWorker.alloc_memory_pool()` · L407–L433](../../python/sglang/srt/managers/tp_worker.py#407-433)；
+- 池的选择见 [`ModelRunner.alloc_memory_pool()` · L881–L903](../../python/sglang/srt/model_executor/model_runner.py#881-903)、[`KVCacheConfigurator.configure()` · L296–L329](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#296-329)、[`_init_pools()` · L397–L510](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#397-510)、[`_build_req_to_token_pool()` · L938–L966](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#938-966) 和 MHA pool/allocator 的两个构造入口（[L1796–L1830](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1796-1830)、[L1832–L1945](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1832-1945)）；
 - tree 构造主流程见 [`build_kv_cache()` · L197–L370](../../python/sglang/srt/mem_cache/kv_cache_builder.py#197-370)；
 - 默认实现选择见 [`default_radix_cache_factory()` · L80–L143](../../python/sglang/srt/mem_cache/registry.py#80-143) 与 [`_create_unified_radix_cache()` · L146–L196](../../python/sglang/srt/mem_cache/registry.py#146-196)。
 
@@ -526,10 +541,10 @@ token IDs 是否真的相同
 | 层 | 文件 | 入口（链接标题已含行号） |
 |---|---|---|
 | page 默认值 | `overrides.py` | [`_page_size_default()` · L1377–L1399](../../python/sglang/srt/arg_groups/overrides.py#1377-1399) |
-| 启动/调度 | `scheduler.py` | [`init_memory_pools()` · L1020–L1033](../../python/sglang/srt/managers/scheduler.py#1020-1033)；[`init_model_worker()` · L1047–L1060](../../python/sglang/srt/managers/scheduler.py#1047-1060)；[`stash_chunked_request()` · L3252–L3253](../../python/sglang/srt/managers/scheduler.py#3252-3253)；[`get_next_batch_to_run()` · L3342–L3379](../../python/sglang/srt/managers/scheduler.py#3342-3379)；[`run_batch()` · L4020–L4092](../../python/sglang/srt/managers/scheduler.py#4020-4092) |
+| 启动/调度 | `scheduler.py` | [`Scheduler.__init__` 中的调用 · L553–L559](../../python/sglang/srt/managers/scheduler.py#553-559)；[`init_target_memory_pool()` · L1006–L1018](../../python/sglang/srt/managers/scheduler.py#1006-1018)；[`init_memory_pools()` · L1020–L1038](../../python/sglang/srt/managers/scheduler.py#1020-1038)；[`init_model_worker()` · L1047–L1060](../../python/sglang/srt/managers/scheduler.py#1047-1060)；[`stash_chunked_request()` · L3252–L3253](../../python/sglang/srt/managers/scheduler.py#3252-3253)；[`get_next_batch_to_run()` · L3342–L3379](../../python/sglang/srt/managers/scheduler.py#3342-3379)；[`run_batch()` · L4020–L4092](../../python/sglang/srt/managers/scheduler.py#4020-4092) |
 | worker | `tp_worker.py` | [`alloc_memory_pool()` · L407–L433](../../python/sglang/srt/managers/tp_worker.py#407-433)；[`init_attention_backends()` · L435–L439](../../python/sglang/srt/managers/tp_worker.py#435-439) |
-| runner 的 pool 接线 | `model_runner.py` | [`init_kv_index_translator()` · L869–L879](../../python/sglang/srt/model_executor/model_runner.py#869-879)；[`alloc_memory_pool()` · L881–L907](../../python/sglang/srt/model_executor/model_runner.py#881-907) |
-| 容量/池构造 | `kv_cache_configurator.py` | [`configure()` · L296–L329](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#296-329)；[`_build_req_to_token_pool()` · L938–L966](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#938-966)；[`_build_mha_kv_pool()` · L1796–L1830](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1796-1830)；[`_build_token_to_kv_pool_allocator()` · L1832–L1945](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1832-1945) |
+| runner 的 pool 接线 | `model_runner.py` | [`alloc_memory_pool()` · L881–L903](../../python/sglang/srt/model_executor/model_runner.py#881-903)；[`init_kv_index_translator()` · L869–L879](../../python/sglang/srt/model_executor/model_runner.py#869-879)；后置接线见 `_init_post_memory_pool_components()` |
+| 容量/池构造 | `kv_cache_configurator.py` | [`configure()` · L296–L329](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#296-329)；[`_init_pools()` · L397–L510](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#397-510)；[`_build_req_to_token_pool()` · L938–L966](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#938-966)；[`_build_mha_kv_pool()` · L1796–L1830](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1796-1830)；[`_build_token_to_kv_pool_allocator()` · L1832–L1945](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1832-1945) |
 | 容量公式 | `pool_configurator.py` | [`DefaultPoolConfigurator._compute_cell_size()` · L248–L362](../../python/sglang/srt/model_executor/pool_configurator.py#248-362)；[普通 MHA 公式 · L338–L345](../../python/sglang/srt/model_executor/pool_configurator.py#338-345) |
 | request row | `memory_pool.py` | [`ReqToTokenPool` · L257–L337](../../python/sglang/srt/mem_cache/memory_pool.py#257-337) 的建表、alloc/release |
 | K/V 数值池 | `memory_pool.py` | [`MHATokenToKVPool` · L1809–L1931](../../python/sglang/srt/mem_cache/memory_pool.py#1809-1931)；[buffer 创建 · L2099–L2163](../../python/sglang/srt/mem_cache/memory_pool.py#2099-2163)；[`set_kv_buffer()` · L2381–L2460](../../python/sglang/srt/mem_cache/memory_pool.py#2381-2460) |
