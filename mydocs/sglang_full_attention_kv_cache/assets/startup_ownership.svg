@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">SGLang KV cache startup ownership</title>
+  <desc id="desc">The startup call chain creates a request-to-token mapping, a K/V backing pool and a unified radix tree. Each object owns a different kind of data.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+    <marker id="blueArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2563eb"/>
+    </marker>
+    <marker id="orangeArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#ea580c"/>
+    </marker>
+    <style>
+      .title { font-family: "Noto Sans CJK SC"; font-size: 26px; font-weight: 700; fill: #0f172a; }
+      .section { font-family: "Noto Sans CJK SC"; font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .label { font-family: "Noto Sans CJK SC"; font-size: 16px; font-weight: 600; fill: #0f172a; }
+      .text { font-family: "Noto Sans CJK SC"; font-size: 14px; fill: #334155; }
+      .small { font-family: "Noto Sans CJK SC"; font-size: 12px; fill: #475569; }
+      .mono { font-family: "DejaVu Sans Mono"; font-size: 13px; fill: #0f172a; }
+      .step { font-family: "DejaVu Sans Mono"; font-size: 12px; fill: #1e3a8a; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="720" fill="#f8fafc"/>
+  <text x="40" y="44" class="title">SGLang 启动时：三类 KV-cache 对象各自拥有不同数据</text>
+  <text x="40" y="70" class="text">先沿调用链建 backing pool，再把这些 pool 交给 UnifiedRadixCache；树元数据不会取代 K/V 数值。</text>
+
+  <rect x="40" y="98" width="1200" height="146" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="62" y="127" class="section">启动调用链（一次性建立基础设施）</text>
+
+  <rect x="62" y="151" width="205" height="62" rx="9" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+  <text x="82" y="177" class="label">Scheduler</text>
+  <text x="82" y="198" class="step">init_model_worker()</text>
+  <line x1="267" y1="182" x2="300" y2="182" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="305" y="151" width="250" height="62" rx="9" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+  <text x="325" y="177" class="label">TpModelWorker / ModelRunner</text>
+  <text x="325" y="198" class="step">alloc_memory_pool()</text>
+  <line x1="555" y1="182" x2="588" y2="182" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="593" y="151" width="250" height="62" rx="9" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+  <text x="613" y="177" class="label">KVCacheConfigurator</text>
+  <text x="613" y="198" class="step">configure()</text>
+  <line x1="843" y1="182" x2="876" y2="182" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="881" y="151" width="335" height="62" rx="9" fill="#fff7ed" stroke="#fb923c" stroke-width="2"/>
+  <text x="901" y="177" class="label">kv_cache_builder</text>
+  <text x="901" y="198" class="step">build_kv_cache() → UnifiedRadixCache</text>
+
+  <text x="40" y="280" class="section">建立后的 ownership 分层</text>
+
+  <rect x="40" y="302" width="375" height="280" rx="12" fill="#ffffff" stroke="#60a5fa" stroke-width="2"/>
+  <rect x="40" y="302" width="375" height="47" rx="12" fill="#dbeafe"/>
+  <text x="62" y="332" class="label">① 请求索引：ReqToTokenPool</text>
+  <text x="62" y="378" class="mono">req_to_token : int32 GPU tensor</text>
+  <text x="62" y="400" class="mono">[size + 1, max_context_len]</text>
+  <text x="62" y="435" class="text">保存：request row → token slot</text>
+  <text x="62" y="458" class="mono">req_to_token[r, p] = s</text>
+  <text x="62" y="496" class="small">owner：运行中的请求 / Scheduler</text>
+  <text x="62" y="518" class="small">生命周期：alloc_rows() → 请求结束 free(req)</text>
+  <text x="62" y="551" class="small">row 归还不会自动释放 slot。</text>
+
+  <rect x="452" y="302" width="375" height="280" rx="12" fill="#ffffff" stroke="#f97316" stroke-width="2"/>
+  <rect x="452" y="302" width="375" height="47" rx="12" fill="#ffedd5"/>
+  <text x="474" y="332" class="label">② 数值 backing：MHATokenToKVPool</text>
+  <text x="474" y="378" class="mono">K[layer], V[layer]</text>
+  <text x="474" y="400" class="mono">[size + page_size, Hkv_local, D]</text>
+  <text x="474" y="435" class="text">保存：每层真正的 K/V 数值</text>
+  <text x="474" y="458" class="mono">set_kv_buffer(layer, loc, k, v)</text>
+  <text x="474" y="496" class="small">owner：pool + token/page allocator</text>
+  <text x="474" y="518" class="small">slot 0 是 dummy；backing 固定，不随 eviction 缩容</text>
+  <text x="474" y="551" class="small">slot 只有 free 后才可被新请求覆盖。</text>
+
+  <rect x="864" y="302" width="376" height="280" rx="12" fill="#ffffff" stroke="#a855f7" stroke-width="2"/>
+  <rect x="864" y="302" width="376" height="47" rx="12" fill="#f3e8ff"/>
+  <text x="886" y="332" class="label">③ 前缀索引缓存：UnifiedRadixCache</text>
+  <text x="886" y="378" class="mono">FULL.value : int64 slot-ID clone</text>
+  <text x="886" y="400" class="mono">NodeId + lock + eviction metadata</text>
+  <text x="886" y="435" class="text">保存：token prefix → slot-ID 向量副本</text>
+  <text x="886" y="458" class="mono">match_prefix() → device_indices</text>
+  <text x="886" y="496" class="small">owner：radix tree；负责复用、锁、淘汰</text>
+  <text x="886" y="518" class="small">不保存 K/V bytes，也不等于 request row</text>
+  <text x="886" y="551" class="small">完成插入 clone；淘汰时把 slot 交回 allocator。</text>
+
+  <line x1="415" y1="442" x2="452" y2="442" stroke="#2563eb" stroke-width="2.5" marker-end="url(#blueArrow)"/>
+  <text x="417" y="427" class="small">slot s</text>
+  <line x1="827" y1="442" x2="864" y2="442" stroke="#ea580c" stroke-width="2.5" marker-end="url(#orangeArrow)"/>
+  <text x="824" y="427" class="small">finish / match</text>
+
+  <rect x="40" y="616" width="1200" height="60" rx="10" fill="#e2e8f0"/>
+  <text x="62" y="643" class="mono">读路径：req_to_token[r,p]=s  →  K/V[layer][s]</text>
+  <text x="62" y="663" class="small">树只提供可复用的 s；attention backend 再把 row/slot 组织成自己的 kernel metadata。</text>
+</svg>

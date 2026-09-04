@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="740" viewBox="0 0 1280 740" role="img" aria-labelledby="title desc">
+  <title id="title">DSA main latent and index-key sidecar share one flat location</title>
+  <desc id="desc">For request A, locations 2624 through 2629 point to offsets zero through five of physical page 41 in both the main latent tensor and the index-key sidecar. The sidecar stores all keys first and all scales second.</desc>
+  <defs>
+    <marker id="blueArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2563eb"/>
+    </marker>
+    <marker id="redArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#dc2626"/>
+    </marker>
+    <style>
+      .title { font-family: "Noto Sans CJK SC"; font-size: 25px; font-weight: 700; fill: #0f172a; }
+      .section { font-family: "Noto Sans CJK SC"; font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .label { font-family: "Noto Sans CJK SC"; font-size: 16px; font-weight: 600; fill: #0f172a; }
+      .text { font-family: "Noto Sans CJK SC"; font-size: 14px; font-weight: 400; fill: #334155; }
+      .small { font-family: "Noto Sans CJK SC"; font-size: 12px; font-weight: 400; fill: #475569; }
+      .mono { font-family: "DejaVu Sans Mono"; font-size: 13px; font-weight: 400; fill: #0f172a; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="740" fill="#f8fafc"/>
+  <text x="40" y="43" class="title">DSA：同一个 loc=2624+i，怎样定位两块独立存储</text>
+  <text x="40" y="70" class="text">A 本轮写 page 41 的 offset 0…5；main 与 sidecar 不共享 bytes，只共享 page/offset 和生命周期。</text>
+
+  <rect x="40" y="105" width="1200" height="122" rx="12" fill="#ffffff" stroke="#60a5fa" stroke-width="2"/>
+  <text x="62" y="136" class="section">地址输入</text>
+  <rect x="62" y="155" width="345" height="46" rx="7" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="82" y="184" class="mono">out_cache_loc = [2624…2629]</text>
+  <text x="445" y="175" class="mono">page = loc // 64 = 41</text>
+  <text x="445" y="197" class="mono">offset = loc % 64 = 0…5</text>
+  <text x="820" y="175" class="mono">req_to_token[23,64:70]</text>
+  <text x="820" y="197" class="mono">= [2624…2629]</text>
+
+  <line x1="455" y1="227" x2="330" y2="282" stroke="#2563eb" stroke-width="2.5" marker-end="url(#blueArrow)"/>
+  <line x1="825" y1="227" x2="955" y2="282" stroke="#2563eb" stroke-width="2.5" marker-end="url(#blueArrow)"/>
+  <text x="520" y="258" class="small">同一个地址关系分叉到两块 tensor</text>
+
+  <rect x="40" y="290" width="570" height="340" rx="12" fill="#ffffff" stroke="#fb923c" stroke-width="2"/>
+  <rect x="40" y="290" width="570" height="49" rx="12" fill="#ffedd5"/>
+  <text x="62" y="322" class="section">Main latent：kv_buffer[layer] 的 physical page 41</text>
+  <text x="62" y="369" class="mono">view = [64, 1, 576] bfloat16</text>
+  <text x="62" y="394" class="text">每个 offset 是一条连续 combined row：</text>
+  <rect x="62" y="416" width="526" height="52" rx="7" fill="#fed7aa" stroke="#fb923c"/>
+  <text x="82" y="448" class="mono">offset 0…5: [c_kv(512) | k_rope(64)]  ← 本轮已写</text>
+  <rect x="62" y="480" width="526" height="52" rx="7" fill="#e2e8f0" stroke="#94a3b8"/>
+  <text x="82" y="512" class="mono">offset 6…63: 未提交 / stale，不得越过 length 读取</text>
+  <text x="62" y="558" class="text">一 token/layer：576×2 B = 1,152 B</text>
+  <text x="62" y="584" class="text">一 page/layer：64×1,152 B = 72 KiB</text>
+  <line x1="258" y1="278" x2="258" y2="290" stroke="#dc2626" stroke-width="3" marker-end="url(#redArrow)"/>
+
+  <rect x="650" y="290" width="590" height="340" rx="12" fill="#ffffff" stroke="#a855f7" stroke-width="2"/>
+  <rect x="650" y="290" width="590" height="49" rx="12" fill="#f3e8ff"/>
+  <text x="672" y="322" class="section">Sidecar：IndexKeyCache.buffer[layer][41]</text>
+  <text x="672" y="369" class="mono">shape = [64 * (128 + 4)] uint8 = [8448] bytes</text>
+  <text x="672" y="394" class="text">物理 page 先放全部 K，再放全部 scale：</text>
+
+  <rect x="672" y="416" width="402" height="54" rx="7" fill="#ddd6fe" stroke="#a855f7"/>
+  <text x="691" y="438" class="mono">K region: K_0 | K_1 | … | K_63</text>
+  <text x="691" y="459" class="small">64 × 128-byte FP8 blocks</text>
+  <rect x="1082" y="416" width="136" height="54" rx="7" fill="#ede9fe" stroke="#a855f7"/>
+  <text x="1097" y="438" class="mono">S_0…S_63</text>
+  <text x="1097" y="459" class="small">64 × 4 B</text>
+
+  <rect x="672" y="488" width="546" height="64" rx="7" fill="#faf5ff" stroke="#c084fc"/>
+  <text x="691" y="513" class="mono">token i: K_i at i*128</text>
+  <text x="691" y="537" class="mono">         S_i at 64*128 + i*4</text>
+  <text x="672" y="582" class="text">offset 0…5 的 K_i 与 S_i 本轮已写；6…63 未提交。</text>
+  <line x1="1000" y1="278" x2="1000" y2="290" stroke="#dc2626" stroke-width="3" marker-end="url(#redArrow)"/>
+
+  <rect x="40" y="662" width="1200" height="48" rx="9" fill="#dcfce7" stroke="#4ade80"/>
+  <text x="62" y="692" class="text">一套 allocator / FULL.value 管 page 41 的世代与可达性；不存在第二套 sidecar request mapping。</text>
+</svg>

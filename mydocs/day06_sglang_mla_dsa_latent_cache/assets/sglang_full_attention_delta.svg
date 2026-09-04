@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="650" viewBox="0 0 1200 650" role="img" aria-labelledby="title desc">
+  <title id="title">SGLang MHA to MLA and DSA cache payload change</title>
+  <desc id="desc">The request-to-token location mapping and unified radix cache remain unchanged. MHA stores expanded K and V, MLA stores a combined latent row, and DSA adds an index-key sidecar at the same location.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+    <marker id="blueArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2563eb"/>
+    </marker>
+    <style>
+      .title { font-family: "Noto Sans CJK SC"; font-size: 25px; font-weight: 700; fill: #0f172a; }
+      .section { font-family: "Noto Sans CJK SC"; font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .label { font-family: "Noto Sans CJK SC"; font-size: 16px; font-weight: 600; fill: #0f172a; }
+      .text { font-family: "Noto Sans CJK SC"; font-size: 14px; font-weight: 400; fill: #334155; }
+      .small { font-family: "Noto Sans CJK SC"; font-size: 12px; font-weight: 400; fill: #475569; }
+      .mono { font-family: "DejaVu Sans Mono"; font-size: 13px; font-weight: 400; fill: #0f172a; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="650" fill="#f8fafc"/>
+  <text x="40" y="43" class="title">Day05 SGLang MHA → Day06 MLA / DSA：地址层不变，payload 改变</text>
+  <text x="40" y="70" class="text">同一个 flat loc 继续贯穿 request row、prefix cache 与 allocator；变化只在 pool 如何解释这行地址。</text>
+
+  <rect x="40" y="100" width="1120" height="165" rx="12" fill="#ffffff" stroke="#60a5fa" stroke-width="2"/>
+  <text x="62" y="132" class="section">共享的地址与生命周期层</text>
+  <rect x="62" y="155" width="295" height="70" rx="8" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="80" y="181" class="label">ReqToTokenPool</text>
+  <text x="80" y="207" class="mono">req_to_token[r,p] = loc</text>
+  <line x1="357" y1="190" x2="413" y2="190" stroke="#2563eb" stroke-width="2.5" marker-end="url(#blueArrow)"/>
+  <rect x="420" y="155" width="295" height="70" rx="8" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="438" y="181" class="label">ForwardBatch / allocator</text>
+  <text x="438" y="207" class="mono">out_cache_loc = new locs</text>
+  <line x1="715" y1="190" x2="771" y2="190" stroke="#2563eb" stroke-width="2.5" marker-end="url(#blueArrow)"/>
+  <rect x="778" y="155" width="350" height="70" rx="8" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="796" y="181" class="label">UnifiedRadixCache / FULL</text>
+  <text x="796" y="207" class="mono">FULL.value = clone(loc[])</text>
+  <text x="62" y="249" class="small">request/tree 控制 loc 的可达性与保护；pool/model runner 拥有常驻 CUDA tensors。</text>
+
+  <text x="40" y="305" class="section">同一个 loc 的三种 payload 解释</text>
+
+  <rect x="40" y="328" width="345" height="230" rx="12" fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="40" y="328" width="345" height="48" rx="12" fill="#e2e8f0"/>
+  <text x="62" y="359" class="label">Day05：MHA / GQA</text>
+  <text x="62" y="407" class="mono">K[layer][loc, Hkv, Dk]</text>
+  <text x="62" y="435" class="mono">V[layer][loc, Hkv, Dv]</text>
+  <text x="62" y="474" class="text">每层两份展开后的 K/V 数值。</text>
+  <text x="62" y="510" class="small">loc 同时选中本层 K row 与 V row。</text>
+  <line x1="212" y1="265" x2="212" y2="322" stroke="#334155" stroke-width="2.2" marker-end="url(#arrow)"/>
+
+  <rect x="427" y="328" width="345" height="230" rx="12" fill="#ffffff" stroke="#fb923c" stroke-width="2"/>
+  <rect x="427" y="328" width="345" height="48" rx="12" fill="#ffedd5"/>
+  <text x="449" y="359" class="label">Day06：MLA</text>
+  <text x="449" y="407" class="mono">kv_buffer[layer][loc,0,:]</text>
+  <rect x="449" y="430" width="140" height="48" rx="7" fill="#fed7aa" stroke="#fb923c"/>
+  <text x="472" y="460" class="mono">c_kv / k_nope</text>
+  <rect x="597" y="430" width="150" height="48" rx="7" fill="#fde68a" stroke="#f59e0b"/>
+  <text x="633" y="460" class="mono">k_rope</text>
+  <text x="449" y="510" class="small">每层一条 compressed combined row。</text>
+  <line x1="600" y1="265" x2="600" y2="322" stroke="#334155" stroke-width="2.2" marker-end="url(#arrow)"/>
+
+  <rect x="814" y="328" width="346" height="230" rx="12" fill="#ffffff" stroke="#a855f7" stroke-width="2"/>
+  <rect x="814" y="328" width="346" height="48" rx="12" fill="#f3e8ff"/>
+  <text x="836" y="359" class="label">Day06：DSA</text>
+  <text x="836" y="405" class="mono">main: kv_buffer[layer][loc]</text>
+  <text x="836" y="438" class="mono">sidecar: page=loc/P</text>
+  <text x="836" y="466" class="mono">         offset=loc%P</text>
+  <text x="836" y="500" class="text">两块独立 tensor，共用一套 loc。</text>
+  <text x="836" y="529" class="small">FULL.value 不需要第二份 sidecar table。</text>
+  <line x1="987" y1="265" x2="987" y2="322" stroke="#334155" stroke-width="2.2" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="590" width="1120" height="38" rx="8" fill="#dcfce7"/>
+  <text x="62" y="615" class="text">不变：mapping / allocation / prefix ownership　　改变：每个 loc 的物理 row layout 与 kernel reader</text>
+</svg>
