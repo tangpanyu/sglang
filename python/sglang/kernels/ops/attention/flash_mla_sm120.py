@@ -28,6 +28,9 @@ _is_hip = is_hip()
 _GLM_DSA_MODEL_ARCHS = (
     "GlmMoeDsaForCausalLM",
     "GlmMoeDsaForCausalLMNextN",
+    # The tiny eager adapter intentionally uses the same SM120 GLM DSA
+    # interface with reduced hidden/head/expert dimensions.
+    "Glm5FlashTinyForCausalLM",
 )
 
 # Page layout constants for DSv4-Flash (MODEL1):
@@ -623,22 +626,97 @@ def flashinfer_sparse_mla_forward(
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
     topk = indices.shape[1]
-    result = trtllm_batch_decode_with_kv_cache_mla(
-        query=q.unsqueeze(1),
-        kv_cache=kv_cache.view(torch.uint8)
-        .view(-1, page_size, kv_cache_dim)
-        .unsqueeze(1),
-        workspace_buffer=workspace_buffer,
-        qk_nope_head_dim=qk_nope_head_dim,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
-        block_tables=indices.unsqueeze(1),
-        seq_lens=seq_lens,
-        max_seq_len=topk,
-        sparse_mla_top_k=topk,
-        bmm1_scale=float(sm_scale),
-        bmm2_scale=1.0,
-        kv_scale_format="arbitrary_fp32",
-        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+    try:
+        result = trtllm_batch_decode_with_kv_cache_mla(
+            query=q.unsqueeze(1),
+            kv_cache=kv_cache.view(torch.uint8)
+            .view(-1, page_size, kv_cache_dim)
+            .unsqueeze(1),
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=indices.unsqueeze(1),
+            seq_lens=seq_lens,
+            max_seq_len=topk,
+            sparse_mla_top_k=topk,
+            bmm1_scale=float(sm_scale),
+            bmm2_scale=1.0,
+            kv_scale_format="arbitrary_fp32",
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        )
+        return result.squeeze(1)
+    except ValueError as exc:
+        # FlashInfer's SM120 dispatch table intentionally covers only the
+        # production GLM shapes.  Tiny/reference models keep the same packed
+        # DSA cache semantics but use fewer heads and top-k entries, so use a
+        # readable eager fallback for those unsupported shapes.
+        if "no decode kernel for this shape" not in str(exc):
+            raise
+        return _torch_sparse_mla_forward(
+            q=q,
+            kv_cache=kv_cache,
+            indices=indices,
+            seq_lens=seq_lens,
+            kv_cache_dim=kv_cache_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            sm_scale=sm_scale,
+        )
+
+
+def _torch_sparse_mla_forward(
+    *,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    kv_cache_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    sm_scale: float,
+) -> torch.Tensor:
+    """Eager sparse MLA for tiny dimensions unsupported by SM120 FlashInfer.
+
+    DSATokenToKVPool stores each token as ``[fp8 latent KV, fp32 scales,
+    bf16 rotary KV]``.  Decode that row format directly, gather the selected
+    token positions, and perform the same causal top-k latent attention.  The
+    return value stays in latent ``kv_lora_rank`` space; the caller's existing
+    absorbed MLA path applies ``w_vc`` and ``o_proj`` afterward.
+    """
+    del seq_lens  # invalid/padded entries in indices carry the causal mask
+    idx = indices
+    if idx.ndim == 3:
+        idx = idx.squeeze(1)
+    if idx.ndim != 2:
+        raise ValueError(f"expected [tokens, topk] DSA indices, got {idx.shape}")
+
+    raw = kv_cache.view(torch.uint8).contiguous().reshape(-1, kv_cache_dim)
+    scale_bytes = kv_lora_rank // 128 * 4
+    rope_bytes = qk_rope_head_dim * torch.tensor([], dtype=torch.bfloat16).element_size()
+    expected_dim = kv_lora_rank + scale_bytes + rope_bytes
+    if kv_cache_dim < expected_dim:
+        raise ValueError(
+            f"packed DSA cache row is too small: {kv_cache_dim} < {expected_dim}"
+        )
+    latent_fp8 = raw[:, :kv_lora_rank].view(torch.float8_e4m3fn)
+    scales = raw[:, kv_lora_rank : kv_lora_rank + scale_bytes].view(torch.float32)
+    latent = (
+        latent_fp8.view(-1, kv_lora_rank // 128, 128).float()
+        * scales.unsqueeze(-1)
+    ).reshape(-1, kv_lora_rank)
+    rope = raw[:, kv_lora_rank + scale_bytes : expected_dim].contiguous().view(
+        torch.bfloat16
     )
-    return result.squeeze(1)
+    keys = torch.cat([latent.to(torch.bfloat16), rope], dim=-1)
+
+    safe = idx.to(torch.long).clamp(0, max(0, keys.shape[0] - 1))
+    selected = keys[safe]
+    valid = idx.ge(0) & idx.lt(keys.shape[0])
+    query = q[..., : keys.shape[-1]].float()
+    scores = torch.einsum("thd,tkd->thk", query, selected.float()) * float(sm_scale)
+    scores = scores.masked_fill(~valid[:, :, None].transpose(1, 2), float("-inf"))
+    weights = torch.softmax(scores, dim=-1)
+    weights = torch.nan_to_num(weights)
+    output = torch.einsum("thk,tkv->thv", weights, selected[..., :kv_lora_rank].float())
+    return output.to(q.dtype)

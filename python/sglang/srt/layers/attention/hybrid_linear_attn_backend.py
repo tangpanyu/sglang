@@ -1090,6 +1090,18 @@ class HybridLinearAttnBackend(AttentionBackend):
         if init is not None:
             init(forward_batch, disable_flashinfer_ragged)
 
+    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+        """Delegate DSA indexer metadata to the full-attention child.
+
+        Hybrid KDA+DSA models expose this wrapper through
+        ``get_attn_backend()``.  The DSA indexer must still see the metadata
+        built by ``DeepseekSparseAttnBackend`` for the full-attention layer.
+        """
+        get_metadata = getattr(self.full_attn_backend, "get_indexer_metadata", None)
+        if get_metadata is None:
+            return None
+        return get_metadata(layer_id, forward_batch)
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)

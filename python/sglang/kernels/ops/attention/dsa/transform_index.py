@@ -7,10 +7,22 @@ import triton.language as tl
 
 
 def transform_index_page_table_prefill(**kwargs):
+    # The fused Triton implementation is specialized for the production GLM
+    # DSA width (top-k=2048). Tiny/reference configurations intentionally use
+    # a smaller top-k; keep their semantics identical with the eager gather
+    # fallback instead of rejecting an otherwise valid sparse layout.
+    topk_indices = kwargs.get("topk_indices")
+    if topk_indices is not None and topk_indices.shape[1] != 2048:
+        ref_kwargs = dict(kwargs)
+        ref_kwargs.pop("cu_seqlens_q", None)
+        return transform_index_page_table_prefill_ref(**ref_kwargs)
     return transform_index_page_table_prefill_fast(**kwargs)
 
 
 def transform_index_page_table_decode(**kwargs):
+    topk_indices = kwargs.get("topk_indices")
+    if topk_indices is not None and topk_indices.shape[1] != 2048:
+        return transform_index_page_table_decode_ref(**kwargs)
     return transform_index_page_table_decode_fast(**kwargs)
 
 

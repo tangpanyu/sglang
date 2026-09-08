@@ -893,11 +893,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
+        # DeepGEMM's paged-MQA logits kernel only enumerates head counts
+        # {8, 16, 32, 64}.  Tiny/reference DSA configurations intentionally
+        # use fewer index heads; pad the query/gate tensors with zero heads so
+        # the same logits/top-k semantics remain available without changing
+        # the configured indexer width.
+        q_kernel, weights_kernel, _ = self._pad_heads_for_deep_gemm(
+            q_fp8, weights
+        )
+
         if self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
-                q_fp8,
+                q_kernel,
                 kv_cache_fp8,
-                weights,
+                weights_kernel,
                 seqlens_32,
                 block_tables,
                 max_seq_len,
@@ -906,9 +915,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif use_cute_dsl:
             logits = cutedsl_paged_mqa_logits(
-                q_fp8,
+                q_kernel,
                 kv_cache_fp8,
-                weights,
+                weights_kernel,
                 metadata.get_seqlens_int32(),
                 block_tables,
                 schedule_metadata,
@@ -926,9 +935,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(
                 deep_gemm.fp8_paged_mqa_logits,
-                q_fp8,
+                q_kernel,
                 kv_cache_fp8,
-                weights,
+                weights_kernel,
                 seqlens_32_2d,
                 block_tables,
                 schedule_metadata,
@@ -940,9 +949,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         else:
             logits = deepgemm_paged_mqa_logits_split(
                 deep_gemm.fp8_paged_mqa_logits,
-                q_fp8,
+                q_kernel,
                 kv_cache_fp8,
-                weights,
+                weights_kernel,
                 seqlens_32_2d,
                 block_tables,
                 schedule_metadata,

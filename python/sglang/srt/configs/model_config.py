@@ -130,6 +130,7 @@ def is_deepseek_dsa(config) -> bool:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "GlmMoeDsaForCausalLMNextN",
+            "Glm5FlashTinyForCausalLM",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
             "Dots3NoteForCausalLM",
@@ -930,6 +931,7 @@ class ModelConfig:
             or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLMNextN" in self.hf_config.architectures
+            or "Glm5FlashTinyForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures

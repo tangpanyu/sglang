@@ -147,6 +147,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "Glm5FlashTinyForCausalLM",
         "LongcatFlashForCausalLM",
         "Dots3NoteForCausalLM",
     ]:

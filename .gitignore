@@ -238,7 +238,7 @@ sgl-model-gateway/tests/fixtures/golden/
 
 # Other repos
 lmms-eval
-
+models
 **/.serena/
 ctags/
 outputs/
