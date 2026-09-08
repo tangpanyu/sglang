@@ -1,583 +1,790 @@
-# Day 05｜SGLang Full Attention KV Cache：从 prefix 命中走到 attention 读写
+# Day 05｜SGLang Full Attention KV Cache：沿源码带读一条请求
 
-> 源码基线：SGLang checkout 的 `HEAD` 为 `db017e34902b51e1fd1ac7ebbedaf720c75b374d`（2026-09-02）。源码链接都指向同一个 checkout；代码变化后请按函数名重新定位，不要把行号当成 API。
+> 源码基线：当前 checkout 的 `HEAD` 为 `89afcd44b62471051be82053ed42230f23eafc5a`（2026-09-04）。链接中的行号只用于快速定位；版本变化后请优先按函数名重新搜索。
 >
-> 文件与目录已经切换为 `sglang_full_attention_kv_cache`，正文也完全使用 SGLang 术语。本文不是 vLLM `BlockPool`/`BlockTable` 的平移版。
+> 本文采用 **source-first**：默认你已经熟悉 MHA 的基本计算，理论只保留理解 SGLang 数据布局所需的最短部分。主线固定为 CUDA、plain decoder-only MHA、Full Attention、单 worker、无 speculative decode、无 DCP/CP、无 HiCache；同时假设 prefix cache 开启，未启用 C++/LMCache/FlexKV 等 registry 替代后端，也没有显式指定其他 radix backend，因此默认树实现是 `UnifiedRadixCache` 的 `FULL` component。其他 backend 和分页分支放到边界章节。
 
-> 源码定位约定：源码链接使用 `文件.py#起始行-结束行`，点击即可跳到当前实现；正文同时保留 `Lx–Ly` 方便扫读，第 8 节集中列出完整入口。这些行号只对上述 commit 有效；切换版本后先按函数名搜索，再用行号确认局部逻辑。
+## 0. 先确定本文要追什么
 
-这篇按“打开源码，沿一条请求走完”的方式写。主线只覆盖 **CUDA、标准 decoder-only MHA、Full Attention、单个 TP rank 的 local KV heads、无 speculative decode、无 DCP/CP、无 SWA/Mamba/MLA/HiCache**。主缓存实现假定 prefix cache 开启且没有显式指定其他 radix-cache backend；这时 registry 为普通 MHA 选择 `UnifiedRadixCache`，树中只有 `ComponentType.FULL`。attention backend 用 FlashInfer 的调用点作具体例子；Triton、FA3、TRTLLM 等实现共享池和索引契约，但元数据格式不同。
+本文只回答一个实现问题：
 
-如果只想先抓住主线，记住三个对象：
+> 一个历史 token 的 K/V，从 SGLang 启动时的 pool 创建开始，怎样经过 prefix 命中、请求分配、forward 写入、attention 读取，最后在完成或淘汰时被释放或继续复用？
 
-1. `ReqToTokenPool.req_to_token`：请求行号 → 每个逻辑 token 的 KV slot。
-2. `MHATokenToKVPool` + allocator：KV slot → 各层 K/V 数值。
-3. `UnifiedRadixCache`：token 前缀 → **复制保存的 slot-ID 向量**，并负责锁和淘汰。
-
-完整因果链只有一行：
-
-~~~text
-启动建池
-→ waiting 请求查 radix prefix
-→ PrefillAdder 锁定命中节点并准入
-→ ScheduleBatch 分配 row/slot
-→ ForwardBatch 交给 RadixAttention/backend
-→ 先写本轮 K/V、再读整段上下文
-→ 完成时插入树、释放请求私有 slot
-→ 显存不足时淘汰未锁定前缀并复用 slot
-~~~
-
-## 0. 先锁定阅读假设和术语
-
-### 0.1 本课范围
-
-| 项目 | 本课假设 | 放宽后需要另读什么 |
-|---|---|---|
-| 模型 | 标准 decoder-only MHA，所有相关层都是 Full Attention | 混合 SWA/Mamba、MLA、DSA 会增加 component 或换池 |
-| page size | CUDA 的默认值通常是 `1`；本文主线固定为 `1` | 显式 `--page-size P`、MUSA、backend 约束会进入 paged allocator |
-| KV layout | 未量化、NHD、`MHATokenToKVPool` | HND、vectorized-5d、FP4/FP8 会改变 buffer 或写入路径 |
-| 并行 | 一个 TP rank 的 local heads；无 DCP/CP/speculation | 需要额外的 ID 翻译、验证窗口或临时容量 |
-| prefix cache | registry 默认的 `UnifiedRadixCache`，`FULL` component | `--disable-radix-cache`、C++/LMCache/FlexKV 等会换实现 |
-| prefill | 数字例子先走一次完整、非 chunked extend | `3.3` 单独说明 chunk boundary 怎样回写 tree |
-| attention | 以 FlashInfer 的 paged 分支说明 | backend 可改写 page size、读表和 kernel metadata |
-| 示例 | 4 个 local Full Attention 层，`Hkv=8`、`Dk=Dv=128`、BF16 | 真实容量以启动时 `KVCacheConfigurator` 的结果为准 |
-
-`page_size=1` 不是“永远没有页”的意思：allocator 仍有容量和 free-list，只是一个 page 只含一个 token，因此 page ID 和 token slot 的数值关系退化为直接索引。SGLang 的默认值和 backend 兼容性修正规则见 [`_page_size_default()` · L1377–L1399](../../python/sglang/srt/arg_groups/overrides.py#1377-1399)。
-
-### 0.2 六个容易混淆的量
-
-| 名称 | 源码对象/类型 | 含义 |
-|---|---|---|
-| 逻辑位置 `p` | 请求序列中的整数位置 | “这是第几个 token”，从 0 开始；不是显存地址 |
-| request row `r` | `ReqToTokenPool` 返回的 Python `int` | `req_to_token` 的行号；一个运行中的请求占一行 |
-| token slot `s` | allocator 返回的 `torch.int64` 元素 | K/V pool 的索引；`page_size=1` 时可直接索引 NHD 的第一维 |
-| page | allocator 的 page ID 和页内 offset | `P>1` 时按页申请，kernel 可能接收 page table；扁平 slot 常写成 `page_id*P+offset` |
-| tree value | `torch.int64` 一维 tensor | radix 节点保存的 slot-ID 副本，不是 K/V bytes，也不是 request row |
-| K/V buffer | 每层一对 GPU tensor | 真正的 key/value 数值；只有 attention 的写入路径会触碰它 |
-
-还要区分四种长度：
-
-- `prefix_indices`：本轮 prefix lookup 返回、可直接复用的 slot 向量。
-- `cache_protected_len`：树当前为请求保护的前缀边界；在普通 `page_size=1` 的 MHA 路径中通常等于 `len(prefix_indices)`。
-- `kv_allocated_len`：请求行已经拿到的 slot 数量。
-- `kv_committed_len`：这些 slot 中已经有本轮有效 KV 的长度，满足 `kv_committed_len <= kv_allocated_len`。
-
-## 1. 启动：先建池，再建树
-
-### 1.1 从 Scheduler 追到三个池
-
-SGLang 的启动顺序不是“请求来了才创建一张 block table”。可以从 [`Scheduler.init_model_worker()` · L1047–L1060](../../python/sglang/srt/managers/scheduler.py#1047-1060) 往下读：
-
-~~~text
-Scheduler
-  → init_model_worker()
-    → init_memory_pools()
-      → TpModelWorker.alloc_memory_pool()
-        → ModelRunner.alloc_memory_pool()
-          → KVCacheConfigurator.configure()
-            → ReqToTokenPool
-            → MHATokenToKVPool
-            → TokenToKVPoolAllocator / PagedTokenToKVPoolAllocator
-          → ModelRunner.init_kv_index_translator()
-    → init_all_attention_backends()
-  → kv_cache_builder.build_kv_cache()
-    → CacheInitParams
-    → registry.create_tree_cache()
-      → UnifiedRadixCache(params)
-~~~
-
-对应源码入口（均为当前基线行号）：
-
-- worker 调用链见 [`init_memory_pools()` · L1020–L1033](../../python/sglang/srt/managers/scheduler.py#1020-1033)、[`init_model_worker()` · L1047–L1060](../../python/sglang/srt/managers/scheduler.py#1047-1060)，以及 [`TpModelWorker.alloc_memory_pool()` · L407–L433](../../python/sglang/srt/managers/tp_worker.py#407-433)；
-- 池的选择见 [`KVCacheConfigurator.configure()` · L296–L329](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#296-329)、[`_build_req_to_token_pool()` · L938–L966](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#938-966) 和 MHA pool/allocator 的两个构造入口（[L1796–L1830](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1796-1830)、[L1832–L1945](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1832-1945)）；
-- tree 构造主流程见 [`build_kv_cache()` · L197–L370](../../python/sglang/srt/mem_cache/kv_cache_builder.py#197-370)；
-- 默认实现选择见 [`default_radix_cache_factory()` · L80–L143](../../python/sglang/srt/mem_cache/registry.py#80-143) 与 [`_create_unified_radix_cache()` · L146–L196](../../python/sglang/srt/mem_cache/registry.py#146-196)。
-
-这里有两个边界：
-
-1. ModelRunner.alloc_memory_pool() 只负责 backing pool、allocator 和 translator，不负责把 token 前缀登记到树。
-2. build_kv_cache() 把已经存在的 pool 交给 UnifiedRadixCache。树元数据和 K/V 数值是两种所有权，不能合成一个“缓存数组”。
-
-![SGLang 启动时请求索引、K/V backing 与 radix tree 的 ownership 分层](assets/startup_ownership.svg)
-
-图 1 只回答“启动后谁保存什么”：`ReqToTokenPool` 保存 row → slot 映射，`MHATokenToKVPool` 保存每层 K/V 数值，`UnifiedRadixCache/FULL` 保存可复用的 slot-ID 副本。三者的生命周期不同，后文的 lookup、forward 和 release 都是在这三个 owner 之间传递索引。
-
-### 1.2 ReqToTokenPool：请求行不是 KV 数据
-
-普通 MHA 使用 [`ReqToTokenPool` · L257–L337](../../python/sglang/srt/mem_cache/memory_pool.py#257-337)：
-
-~~~text
-req_to_token: torch.Tensor
-dtype  = int32
-device = runner device
-shape  = [size + 1, max_context_len]
-~~~
-
-size 是可同时登记的请求数；代码额外留出 row 0 作为 dummy/padding，所以真实 free row 从 1 开始。free_slots 是 Python 列表，alloc_rows() 取出 row ID 并更新 generation；free(req) 只归还这一行。它不释放行里指向的 KV slot，slot 的回收由 allocator 和 tree-cache 生命周期决定。
-
-可以把它写成：
+MHA 理论只需要记住一件事：第 $l$ 层的历史 K/V 是按 token 保存的两块数据，当前 query 不需要进入 cache。对一个物理 slot `loc`，可以把它抽象成：
 
 $$
-\texttt{req\_to\_token}[r,p] = s
+K_l[\mathrm{loc}],\quad V_l[\mathrm{loc}]
 $$
 
-左边是“请求 $r$ 的逻辑位置 $p$”，右边才是“去 K/V pool 取第 $s$ 行”。这张表本身不存 K/V 数值。
+请求的逻辑位置并不是 `loc`。SGLang 先用 request row 把“第几个 token”映射到 slot，再由 attention backend 根据 batch metadata 读取这些 slot。
 
-### 1.3 MHATokenToKVPool：每层各有 K/V backing
+### 0.1 首屏总览
 
-未量化、NHD 分支的 [`MHATokenToKVPool` · L1809–L1931](../../python/sglang/srt/mem_cache/memory_pool.py#1809-1931) 为每个 local layer 建一对 buffer：构造与布局在 L1809–L1931，[buffer shape 与创建 · L2099–L2163](../../python/sglang/srt/mem_cache/memory_pool.py#2099-2163)在 L2099–L2163，[普通写入路径 · L2381–L2460](../../python/sglang/srt/mem_cache/memory_pool.py#2381-2460)在 L2381–L2460。源码的 shape 是：
+```mermaid
+flowchart TD
+    subgraph START[启动阶段]
+        S["Scheduler.__init__"] --> W["init_model_worker()"]
+        W --> IM["init_memory_pools()"]
+        IM --> IT["init_target_memory_pool()"]
+        IT --> TP["TpModelWorker.alloc_memory_pool()"]
+        TP --> MR["ModelRunner.alloc_memory_pool()"]
+        MR --> CFG["KVCacheConfigurator.configure()"]
+        CFG --> POOLS["ReqToTokenPool + MHATokenToKVPool + allocator"]
+        S -->|init_model_worker 返回后| TREE["build_kv_cache() → UnifiedRadixCache"]
+    end
+    subgraph REQ[请求阶段]
+        R["Req.init_next_round_input()"] --> LOOK["match_prefix()"]
+        LOOK --> LOCK["PrefillAdder 准入并加锁"]
+        LOCK --> ALLOC["prepare_for_extend() / alloc_for_extend()"]
+        ALLOC --> ROW["req_to_token[r,p] = loc"]
+        ROW --> FB["ForwardBatch"]
+        FB --> BACK["RadixAttention → attention backend"]
+        BACK --> WRITE["set_kv_buffer(loc, K, V)"]
+        BACK --> READ["按 row/metadata 读取历史 K/V"]
+        READ --> FIN["finish"]
+        FIN --> INSERT["tree 接管已提交 slot-ID"]
+        INSERT --> EVICT["后续 eviction 才释放 tree-owned slots"]
+        READ --> RET["retract / preempt"]
+        RET --> FREE["释放私有尾部或做 host backup"]
+    end
+    POOLS -. allocator / table ownership .-> ROW
+    TREE -. prefix lookup/eviction .-> LOOK
+```
 
-~~~text
-K[layer]: [size + page_size, Hkv_local, Dk]
-V[layer]: [size + page_size, Hkv_local, Dv]
-~~~
+图中有两条线，但它们的职责不同：启动阶段创建对象；请求阶段只携带这些对象的索引和状态。`UnifiedRadixCache` 保存的是可复用的 slot-ID 引用，不是 K/V bytes。
 
-当本文的 size 就是能容纳的K/V cache数量， page_size=1 时就是 [size+1, Hkv_local, D]；**slot 0 对应 dummy 行**。HND、量化和后捕获分支会改 shape，不能把上面的 NHD 形状外推到所有模型。
+### 0.2 四个 owner 先分清
 
-set_kv_buffer() 只接收 layer、写入位置 loc 和当前 K/V tensor，做边界检查后把数值写入对应层。它不知道 token hash、radix node 或请求引用计数；这些信息已经在上游表和树中解决。
+| 对象 | 保存什么 | 谁写入 | 谁读取 | 生命周期 |
+|---|---|---|---|---|
+| `ReqToTokenPool` | request row → 逻辑 token 的 slot 表 | allocation | `ForwardBatch` 提供的 row ID + backend 的 `KVIndexTranslator` | 请求运行期间 |
+| `TokenToKVPoolAllocator` | 可分配、可释放的 slot/page | allocator | allocation/eviction | pool 常驻 |
+| `MHATokenToKVPool` | 每层真正的 K/V tensor | attention backend | attention backend/kernel | pool 常驻 |
+| `UnifiedRadixCache` | token prefix → slot-ID tensor 副本、锁、淘汰状态 | finish/unfinished-cache | prefix lookup/eviction | cache entry 生命周期 |
 
-### 1.4 allocator：`page_size=1` 是 token allocator，`page_size>1` 才显式按页
+后文每节都会回答四个问题：**从哪里进、状态改了什么、谁消费、下一跳去哪**。
 
-这里有两个容易混淆的量：
+### 0.3 这篇文档怎么带你读
 
-- `page_size` 是一个物理 page 容纳多少个 token；`page_size=1` 表示一个 page 只有一个 token。
-- `page_id` 是某个具体物理 page 的编号。allocator 预留 slot 0 做 dummy，所以 free-list 从 `page_id=1` 开始。
+不要把后面的代码块当成需要一次性背下来的 API。每一段只做一件事：先接住上一段交来的对象或字段，再把它交给下一段。读每个代码块时，按下面三个问题停一下：
 
-当 `page_size=1` 时，`page_id=1` 对应的 flat loc 也恰好是 1；当 `page_size=64` 时，`page_id=1` 对应的是 `loc=64..127`。数值相同只是退化路径下的结果，不要把 `page_size=1` 读成“第 1 页”。
+1. 这一段拿到的输入是谁刚刚产生的？
+2. 哪一行真正改变了状态，或把状态交给了另一个 owner？
+3. 下一段会从哪里取走这个结果？
 
-普通 CUDA、无 DCP、page_size=1 时，configurator 选择 [`TokenToKVPoolAllocator` · L28–L75](../../python/sglang/srt/mem_cache/allocator/token.py#28-75)：
+因此正文会采用“短源码 → 关键解释 → 下一跳”的节奏。解释不会逐行翻译，而是只挑会改变索引、shape、owner 或生命周期的语句。你第一次阅读时可以沿着正文走完主线；需要 debug 时，再点击同一段旁边的源码链接深入分支。
 
-~~~text
-free_pages = [1, 2, ..., size]
-slot 0     = dummy
-alloc(n)   = 取出 n 个 slot，返回 int64 tensor
-free(x)    = 把 slot 放回 free/release 容器
-~~~
+文中的 Python 代码块都标明了来源；写着“压缩展示”或“省略与主线无关字段”时，表示它是从真实源码删掉分支后的阅读版本，不保证可以原样复制运行。真正需要运行/断点时，以旁边的文件行号为准。
 
-如果 page_size=P>1，则选择 [`PagedTokenToKVPoolAllocator` · L105–L271](../../python/sglang/srt/mem_cache/allocator/paged.py#105-271)（类与 `alloc/free` 主路径）：
+## 1. 启动建池：不要从 `ModelRunner` 猜入口
 
-- free_pages 保存 page ID（同样从 1 开始）；
-- alloc_extend() 根据 prefix 的最后一个 slot、序列长度和 P，处理已有页的尾部、新整页和最后的 partial page；
-- 返回值仍可是一维 token-slot tensor，常见形式是 page_id * P + offset；
-- free() 会用 free_index // P 去重后归还 page。
+### 1.1 真实入口
 
-所以“按页申请”和“按 slot 写入”是两个相邻但不同的粒度。本文主线用 P=1，避免把 vLLM 的 physical block 概念误带进 SGLang。
+```mermaid
+flowchart LR
+    A["Scheduler.__init__"] --> W["init_model_worker"]
+    W --> B["init_memory_pools"]
+    B --> C["init_target_memory_pool"]
+    C --> D["TpModelWorker.alloc_memory_pool"]
+    D --> E["ModelRunner.alloc_memory_pool"]
+    E --> F["KVCacheConfigurator.configure"]
+    F --> G["_init_pools"]
+    G --> H["ReqToTokenPool"]
+    G --> I["MHATokenToKVPool"]
+    G --> J["TokenToKVPoolAllocator"]
+    E --> K["_init_post_memory_pool_components<br/>→ init_kv_index_translator"]
+    A -->|init_model_worker 返回后| L["build_kv_cache<br/>→ registry.create_tree_cache"]
+    L --> M["UnifiedRadixCache"]
+```
 
-### 1.5 容量和字节数：算的是 pool，不是本轮申请
+**导航卡**
 
-在本课的未量化 MHA 假设下，一层每个 token 的 K/V payload 为：
+- 从哪里进：[`Scheduler.__init__`](../../python/sglang/srt/managers/scheduler.py#548-559) 调 [`init_model_worker`](../../python/sglang/srt/managers/scheduler.py#1047-1060)，返回后才调用 `build_kv_cache()`。
+- 这一段看什么：`init_memory_pools()` 内的 target-only helper，以及 `TpModelWorker` 如何把入口转给 runner。
+- 下一跳：[`ModelRunner.alloc_memory_pool`](../../python/sglang/srt/model_executor/model_runner.py#881-903) → `KVCacheConfigurator.configure()`。
+- 先忽略什么：`draft_worker`、CUDA graph、HiCache；它们不改变 plain target pool 的创建契约。
+
+先看外层函数，确认这不是一条凭空拼出的类名链：
+
+```python
+# scheduler.py#1047-1060，省略权重 overlap 和 warmup 细节
+def init_model_worker(self):
+    self.init_tp_model_worker()
+    self.maybe_init_draft_worker()
+    self.init_memory_pools()
+    self.init_all_attention_backends()
+    self.init_all_cuda_graphs()
+```
+
+**带读。** `init_memory_pools()` 位于 worker 创建之后、attention backend 初始化之前：backend 启动时已经可以拿到 pool，但 pool 创建本身不依赖 backend。接下来只展开 `init_memory_pools()` 的 target 分支，读者就能把 Mermaid 中的第一条边和真实代码对上。
+
+Scheduler 的中间层是：
+
+```python
+# scheduler.py，保留主线语句
+def init_memory_pools(self):
+    self.init_target_memory_pool()
+    ...
+
+def init_target_memory_pool(self):
+    ...
+    self.tp_worker.alloc_memory_pool()
+```
+
+对应[`init_model_worker`](../../python/sglang/srt/managers/scheduler.py#1047-1060)、[`init_memory_pools`](../../python/sglang/srt/managers/scheduler.py#1020-1033)和[`init_target_memory_pool`](../../python/sglang/srt/managers/scheduler.py#1006-1018)。所以你在 IDE 里找不到“`init_memory_pools` 直接调用 `TpModelWorker`”是正常的，中间就是这个 helper。
+
+**带读。** 这里有一个容易迷路的生命周期边界：`init_model_worker()` 不只是“加载模型”，它还负责把 KV pool 建好；而 `build_kv_cache()` 要等它返回，才能拿到已经存在的 pool 去创建树。也就是说，树不是先于 pool 的抽象目录，树创建时已经知道自己要管理哪一个 allocator 和哪一张 request table。记住这条先后关系，后面看到 prefix 命中时就不会误以为 radix tree 自己保存了 K/V。
+
+接下来沿着 `init_target_memory_pool()` 往下走。这个 helper 是“target worker 需要建池”的判断点，真正把工作转交给 `TpModelWorker` 的调用就在这里。
+
+### 1.2 `TpModelWorker` 只转交 pool 工作
+
+**导航卡**
+
+- 从哪里进：`Scheduler.init_target_memory_pool()`。
+- 这一段看什么：它把共享的 `req_to_token_pool` / allocator 接到 runner，并调用 runner 的同名方法。
+- 下一跳：`ModelRunner.alloc_memory_pool()`。
+- 先忽略什么：`model_runner_list[1:]` 是同一 worker 内的其他 runner 镜像，不是另一套 cache 设计。
+
+源码的关键部分是：
+
+```python
+# tp_worker.py#407-424
+def alloc_memory_pool(
+    self,
+    memory_pool_config=None,
+    req_to_token_pool=None,
+    token_to_kv_pool_allocator=None,
+):
+    if req_to_token_pool is not None:
+        self.req_to_token_pool = req_to_token_pool
+        self.model_runner.req_to_token_pool = req_to_token_pool
+    if token_to_kv_pool_allocator is not None:
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.model_runner.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+    self.model_runner.alloc_memory_pool(memory_pool_config)
+```
+
+完整入口见[`TpModelWorker.alloc_memory_pool`](../../python/sglang/srt/managers/tp_worker.py#407-433)。它不是 KV layout 的实现者；它负责把 worker 级依赖传给 `ModelRunner`。
+
+**带读。** 这段没有分配 tensor，反而很重要：如果调用方传入了已有的 `req_to_token_pool` 或 allocator，worker 先把同一个对象的引用接到自己和 `model_runner` 上；没有传入时，才让 runner 自己按配置创建。这样 draft worker 或同一 worker 的多个 runner 可以共享地址管理，而不会悄悄复制一套映射表。最后一行才是本条主线的下一跳：进入 `ModelRunner.alloc_memory_pool()`。
+
+### 1.3 `ModelRunner` 接收 configurator 的结果
+
+```python
+# model_runner.py#881-902，省略与主线无关的字段
+def alloc_memory_pool(self, memory_pool_config=None):
+    if memory_pool_config is not None:
+        self.memory_pool_config = memory_pool_config
+    self.init_kv_cache_configurator()
+    result = self.kv_cache_configurator.configure(
+        pre_model_load_memory=self.pre_model_load_memory
+    )
+    self.max_total_num_tokens = result.max_total_num_tokens
+    self.req_to_token_pool = result.req_to_token_pool
+    self.token_to_kv_pool = result.token_to_kv_pool
+    self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+    self._init_post_memory_pool_components()
+```
+
+这里最容易误读的点是：`configure()` 返回的是一组已经创建好的对象；`ModelRunner` 只是接住并保存引用。`_init_post_memory_pool_components()` 随后调用[`init_kv_index_translator`](../../python/sglang/srt/model_executor/model_runner.py#869-879)，这是读表转换器的后置接线，不是 pool 构造的一部分。
+
+**带读。** `ModelRunner` 在这里完成的是“接线”，不是“决定每个 token 怎么算”。`configure()` 根据显存预算和模型配置完成构造，返回的 `result` 里已经有三种不同职责的对象；这几行把它们保存成 runner 后续 forward 会使用的属性。最后的 `_init_post_memory_pool_components()` 把 `req_to_token`、allocator 和 KV pool 交给 translator，形成从请求行到 kernel-facing index 的读路径。现在 pool 的 owner 已经确定，下一段才去看 configurator 如何选择具体实现。
+
+### 1.4 configurator 选择 plain MHA 的三个对象
+
+**导航卡**
+
+- 从哪里进：`KVCacheConfigurator.configure()`。
+- 这一段看什么：`_init_pools()` 返回 `req_to_token_pool`、`token_to_kv_pool`、`token_to_kv_pool_allocator`。
+- 下一跳：plain MHA 继续到 `_build_token_to_kv_pool()`、`_build_mha_kv_pool()` 和 allocator 分支。
+- 先忽略什么：unified memory、hybrid SWA/Mamba、DSA/MLA 分支。
+
+入口见[`configure`](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#296-329)和[`_init_pools`](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#397-595)。plain MHA 的关键构造点是：
+
+- request table：[`_build_req_to_token_pool`](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#938-966)；
+- MHA backing：[`_build_mha_kv_pool`](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1796-1830)；
+- allocator：[`_build_token_to_kv_pool_allocator`](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1832-1960)。
+
+普通 CUDA、`page_size=1`、无 DCP 时，allocator 分支选择[`TokenToKVPoolAllocator`](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1928-1937)；否则会进入 paged 或硬件专用 allocator。`build_kv_cache()` 是下一阶段：[`kv_cache_builder.build_kv_cache`](../../python/sglang/srt/mem_cache/kv_cache_builder.py#197-370)取已有 pool，再由[`registry.create_tree_cache`](../../python/sglang/srt/mem_cache/registry.py#80-196)选择 `UnifiedRadixCache`。
+
+**带读。** `configure()` 的关键不是函数名，而是它把“同一个抽象契约”落成三种对象：一张 row→slot 表、一块按 slot 存 K/V 的 backing，以及一个发放/回收 slot 的 allocator。分支条件只决定具体类和布局；后面请求生命周期依赖的仍是这三个契约。到这里可以先暂停启动链：pool 已经存在，tree 也拿到了 pool 的引用；接下来我们只追一个请求如何使用这些对象。
+
+## 2. 先分清 row、slot、K/V 和 tree
+
+这一节是后面读请求生命周期的词典。不要把它们都叫“cache index”。
+
+### 2.1 request row：`ReqToTokenPool`
+
+**导航卡**
+
+- 从哪里进：`KVCacheConfigurator._build_req_to_token_pool()`。
+- 这一段看什么：`req_to_token` 的 shape、dummy row、`alloc_rows/free_rows`。
+- 下一跳：`allocation.write_cache_indices()` 把 prefix 和新 slot 写入这张表。
+
+源码在[`ReqToTokenPool`](../../python/sglang/srt/mem_cache/memory_pool.py#257-337)：
+
+```python
+# memory_pool.py#273-283
+self._alloc_size = size + 1
+self.req_to_token = torch.zeros(
+    (self._alloc_size, max_context_len),
+    dtype=torch.int32,
+    device=device,
+)
+self.free_slots = list(range(1, self._alloc_size))
+```
+
+因此：
+
+- `r` 是 request row，不是 KV slot；
+- `p` 是请求内逻辑 token 位置；
+- `req_to_token[r, p]` 的值才是 `loc`；
+- row 0 是 padding/dummy，真实 row 从 1 开始；
+- `free_rows()` 只归还 request row，不自动释放 row 指向的 K/V slot。
+
+**带读。** 可以先用一个具体索引把这张表固定下来：假设 `req_pool_idx=4`，请求中的第 2 个 token 对应 `req_to_token[4, 2] = 17`，那么 `4` 是“这条请求占用的行”，`2` 是逻辑位置，`17` 才是 K/V pool 的物理 slot。表里只存最后这个整数，不存 K/V 数值。这样做的好处是请求结束时可以归还 row，而 slot 的释放仍由 allocator/tree 根据自己的生命周期决定；两种回收不会互相混淆。
+
+下一段沿着值 `17` 继续走：它会被拿去索引 `MHATokenToKVPool` 的第一维。
+
+### 2.2 K/V 数值：`MHATokenToKVPool`
+
+MHA 理论在这里落地成物理 tensor。默认 NHD layout 的核心 shape 是：
 
 $$
-\text{bytes}_{\text{token,layer}}
- = H_{kv,\text{local}}\,(D_k+D_v)\,s_{\text{dtype}}
-$$
-
-4 个 local Full Attention 层的每 token 总量再乘以 $L_{\text{local}}=4$。以 Hkv_local=8、Dk=Dv=128、BF16（2 bytes）为例：
-
-$$
-8 \times (128+128) \times 2
- = 4096\ \text{bytes}
- = 4\ \text{KiB/token/layer}
-$$
-
-因此 37 个 token 的有效 payload 是：
-
-$$
-37 \times 4\ \text{KiB} = 148\ \text{KiB/layer},
+K_l\in\mathbb{R}^{(\mathrm{size}+\mathrm{page\_size})\times H_{kv}\times D_k},
 \qquad
-148 \times 4 = 592\ \text{KiB/4 layers}.
+V_l\in\mathbb{R}^{(\mathrm{size}+\mathrm{page\_size})\times H_{kv}\times D_v}.
 $$
 
-这是“已有 37 个 token 的数值”所占空间，不等于启动时只分配 592 KiB。DefaultPoolConfigurator 用每 token、跨 local layers 的 cell_size，按
+对应源码 `_kv_buffer_shapes()` 的返回值是 `(rows, head_num, head_dim)` 和 `(rows, head_num, v_head_dim)`，其中 `rows=size+page_size`：[`memory_pool.py#2099-2110`](../../python/sglang/srt/mem_cache/memory_pool.py#2099-2110)。buffer 的实际创建在[`#2112-2163`](../../python/sglang/srt/mem_cache/memory_pool.py#2112-2163)。
 
-$$
-\text{available\_bytes}
- = \text{max\_tokens}\times\text{coeff}+\text{bias}
-$$
+这里的第一维不是某条请求的长度，而是全局可寻址的 slot 行。第二维是当前 TP rank 负责的 KV heads，最后一维是每个 head 的维度；`layer_num` 则让 pool 为每个有效 layer 各持有一对 K/V buffer。因此同一个 `loc=17` 在不同 layer 中代表不同的一行数值，但在同一 layer 内，K 和 V 共享这个 slot 坐标。
 
+**导航卡**
 
-反推整个 pool 能容纳多少 token；实现和量化修正见 [`DefaultPoolConfigurator._compute_cell_size()` · L248–L362](../../python/sglang/srt/model_executor/pool_configurator.py#248-362)（其中[普通 MHA 公式 · L338–L345](../../python/sglang/srt/model_executor/pool_configurator.py#338-345)）。实际 backing 还包含 dummy slot、对齐和可能的 scale/布局开销。
+- 从哪里进：`KVCacheConfigurator._build_mha_kv_pool()`。
+- 这一段看什么：每个有效 layer 一对 `k_buffer/v_buffer`，以及 `set_kv_buffer()` 如何把 `loc` 映射到物理行。
+- 下一跳：attention backend 在 forward 中调用 `set_kv_buffer()`，随后 wrapper 读取 `get_kv_buffer()`。
 
-## 2. Prefix lookup：树返回 slot 向量，不搬 K/V
+写入接口的关键契约是：
 
-### 2.1 请求如何生成 lookup key
+```python
+# memory_pool.py#2381-2460，压缩展示
+def set_kv_buffer(
+    self,
+    layer,
+    loc_info,
+    cache_k,
+    cache_v,
+    k_scale=None,
+    v_scale=None,
+    layer_id_override=None,
+    dcp_kv_mask=None,
+):
+    loc, _, _ = unwrap_write_loc(loc_info)
+    layer_id = layer_id_override or layer.layer_id
+    ...
+    self._store_kv_layer(layer_id - self.start_layer, loc, cache_k, cache_v)
+```
 
-waiting 请求进入 [`Req.init_next_round_input()` · L1390–L1489](../../python/sglang/srt/managers/schedule_batch.py#1390-1489) 时，先把 `origin_input_ids + output_ids` 刷新成 `full_untruncated_fill_ids`，再计算允许命中的最大前缀：
+它只关心 `loc`、当前层和 K/V 数值，不知道 token hash、radix node 或请求锁。完整实现见[`MHATokenToKVPool.set_kv_buffer`](../../python/sglang/srt/mem_cache/memory_pool.py#2381-2460)。
 
-~~~python
-key_limit = max(input_len - 1, 0)
-key = RadixKey(
-    full_untruncated_fill_ids,
-    extra_key=req.extra_key,
-    cache_salt=req.cache_salt,
-    limit=key_limit,
-)
-result = tree_cache.match_prefix(
-    MatchPrefixParams(key=key, req=req, cow_mamba=False)
-)
-~~~
+**带读。** `unwrap_write_loc()` 只是把 backend 可能携带的附加定位信息拆出真正的 `loc`；随后 `layer_id` 决定写哪一对 per-layer buffer，最后 `_store_kv_layer()` 才执行物理写入。注意这里完全没有 token ID 匹配或树操作，所以它只能消费上游已经准备好的地址。下一段的 allocator 正是这些地址的生产者。
 
-这段是源码的关键等价形式，省略了 multimodal/SWA 等分支。input_len - 1 是有意保留最后一个 token 给 logits；因此一个长度恰好为 37 的新请求，lookup 最多只查 36 个 token。extra_key 和 cache_salt 是命名空间，不能只看 token IDs 就假定可共享。
+### 2.3 allocator：谁给出 `loc`
 
-这里必须把“逻辑 key”和“物理 value”分开：[`RadixKey` · L59–L85](../../python/sglang/srt/mem_cache/radix_cache.py#59-85) 的主体是 token IDs 加命名空间，而 tree value 才是 slot IDs。匹配也不是拿整段 prefix 的一个 hash 就直接判相等：[`child_key()` · L217–L229](../../python/sglang/srt/mem_cache/radix_cache.py#217-229) 先取首 token/首 page 构造可哈希的字典 key，tree 在 [`_match_prefix_helper()` · L725–L810](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#725-810) 中先查 `node.children`（[L738](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#738-738)、[L779–L780](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#779-780)），再由 [`RadixKey.match()` · L181–L215](../../python/sglang/srt/mem_cache/radix_cache.py#181-215) 对 edge 上的 token slice 做精确比较（[调用点 L786–L787](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#786-787)）。所以它是“hash/dict 缩小候选 + token 序列精确匹配”，不是逐个 child 线性扫描，也不是只相信 hash。
+在本文忽略 disaggregation 的 `release_pages` 分支时，plain CUDA `page_size=1` 的 `TokenToKVPoolAllocator` free list 从 1 开始，slot 0 保留给 dummy 写入：
 
-这点和 vLLM 的共同点是：prefix cache 的逻辑身份都来自 token 序列，都会借助可哈希 key 加速候选查找；差别是这里的默认实现沿 radix edge 匹配可变长 token slice。`UnifiedTreeNode.hash_value` 的 SHA 链只在 storage/KV event 等能力开启时由 [`_add_new_node()` · L1212–L1226](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#1212-1226) 条件计算，不是默认内存树查找的唯一依据。
+```python
+# allocator/token.py#42-63
+def clear(self):
+    self.free_pages = torch.arange(
+        1, self.size + 1, dtype=torch.int64, device=self.device
+    )
 
-RadixKey.page_aligned(P) 在 P>1 时向下取整；`page_size=1` 时不改变长度。命中结果写回：
+def alloc(self, need_size):
+    select_index = self.free_pages[:need_size]
+    self.free_pages = self.free_pages[need_size:]
+    return select_index
+```
 
-~~~text
-req.prefix_indices      = MatchResult.device_indices  # 1-D int64
-req.last_node            = last_device_node            # Unified tree 的 NodeId
-req.kv.cache_protected_len
-  = result.cache_protected_len 或 len(prefix_indices)
-~~~
+所以在这个主线里，allocator 返回的是一维 `int64` slot tensor；它不写 `req_to_token`，也不写 K/V。`allocation.py` 把这两个动作接起来。
 
-### 2.2 当前默认的 UnifiedRadixCache
+**带读。** allocator 的职责可以刻意说得很窄：它只回答“这次给你哪些可写地址”。`alloc()` 消耗 free list，`write_cache_indices()` 才把地址放进某个 request row，attention backend 再把 K/V 数值写到这些地址。slot 0 作为 dummy 的原因是 CUDA graph 或 padding token 可能需要一个安全的落点；它不是一条真实请求的缓存。
 
-普通 MHA 走 [`registry._create_unified_radix_cache()` · L146–L196](../../python/sglang/srt/mem_cache/registry.py#146-196)（[`tree_components=(FULL,)` 的选择 · L158–L165](../../python/sglang/srt/mem_cache/registry.py#158-165)），再构造 [`UnifiedRadixCache` · L157–L230](../../python/sglang/srt/mem_cache/unified_radix_cache.py#157-230)。它把结构、NodeId、锁和淘汰交给 [`UnifiedTreeCore` · L386–L450](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#386-450)。
+`page_size>1` 时，allocator 可能按 page 申请、按 token-slot 返回；这会引入 page ID、offset 和 page table，但不会改变“allocator 给地址、pool 存数值”的 ownership。只在第 7 节简述，不把它混进主线。
 
-[`UnifiedTreeCore.match_prefix()` · L698–L810](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#698-810) 做的事情可以压缩成三步：
+### 2.4 prefix tree：`UnifiedRadixCache` 保存的是 slot-ID 副本
 
-1. 沿 radix child 按 RadixKey 比较 token，必要时把已有节点切分；
-2. 拼接每个匹配节点 FULL component 的 value；
-3. 返回 MatchResult.device_indices（一维 slot-ID tensor）以及 last_device_node/best_match_node 等 NodeId。
+`build_kv_cache()` 创建 tree 后，`UnifiedRadixCache`/`UnifiedTreeCore` 管理的是：
 
-`FULL` 在这里是 component 类型/字典索引，不是 tensor 坐标。它让统一树能同时容纳 Full Attention、SWA、Mamba 等不同缓存组件；纯 MHA 只有 `(FULL,)`。实现见 [`FullComponent` · L43–L344](../../python/sglang/srt/mem_cache/unified_cache/components/full_component.py#43-344)：[match validator · L105–L140](../../python/sglang/srt/mem_cache/unified_cache/components/full_component.py#105-140)、[切分时 clone value · L142–L158](../../python/sglang/srt/mem_cache/unified_cache/components/full_component.py#142-158)、[lock/unlock · L263–L344](../../python/sglang/srt/mem_cache/unified_cache/components/full_component.py#263-344)。树拥有的是 slot-ID 副本；命中时不会搬运 K/V 数值，也不会新建一份 K/V backing。
+| tree 内状态 | 含义 |
+|---|---|
+| `RadixKey` | token IDs、`extra_key`、`cache_salt` 等逻辑身份 |
+| `FULL.value` | 在本文 plain Full Attention 路径中，是一维 slot-ID tensor 的副本 |
+| `NodeId`/lock | 节点的保护和淘汰状态 |
 
-请求被 PrefillAdder.add_one_req() 接受后，调度策略才调用 _req_inc_lock_ref()，沿 last_node 向根增加 component lock。锁的作用是让这段树路径暂时不可淘汰，不是给每一个 K/V 数值再加一份独立的引用计数。请求完成或离开运行集时再对称地 decrement。
+它不保存 K/V bytes。命中时返回 `device_indices`，attention 仍通过 request row 或 translator 访问真正的 pool；其他 component（如 SWA、Mamba、C128）可能有不同的 value 语义。
 
-### 2.3 三张表在同一时刻分别保存什么
+**带读。** 这解释了 prefix cache 的“复用”到底复用了什么：树复用的是一串已经算过的物理地址，而不是把 K/V 从一个节点复制到另一个节点。命中后，请求只需把这串 slot-ID 接到自己的 row 上；后续 kernel 通过 row/translator 找回同一批 K/V。树负责逻辑身份、锁和淘汰，pool 负责数值，这两个 owner 要一直分开看。
 
-| 结构 | 示例内容 | 谁消费 |
+入口：[`UnifiedRadixCache.match_prefix`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#523-539)、[`UnifiedTreeCore.match_prefix`](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#698-810)。当前 plain MHA 默认 component 是 `FULL`，选择见[`registry.py#146-196`](../../python/sglang/srt/mem_cache/registry.py#146-196)。
+
+### 2.5 请求上的几个长度字段
+
+这些字段都描述“这条请求如何使用地址”，不是 K/V tensor 的另一份副本：
+
+| 字段 | 语义 | 谁更新 |
 |---|---|---|
-| req.prefix_indices | [1, 2, 3, ...]，设备上的 1-D int64 | ScheduleBatch.prepare_for_extend() |
-| req_to_token[r, :] | 当前请求行，把 prefix 和本轮新 slot 拼成完整映射 | attention backend 的读表构造 |
-| radix node FULL.value | 对已缓存前缀的 slot-ID clone | 下一次 match_prefix()、lock、evict |
+| `prefix_indices` | prefix lookup 返回、可以直接复用的 slot-ID 向量 | `match_prefix()` |
+| `cache_protected_len` | 当前请求需要 tree lock 保护的前缀边界 | lookup / unfinished-cache rematch |
+| `kv_allocated_len` | request row 已经拿到 slot 的逻辑长度 | `alloc_for_extend()` / `alloc_for_decode()` |
+| `kv_committed_len` | 当前已纳入有效上下文、可交给 finish/tree 处理的长度 | plain、无 overlap 的主线中通常随 allocation 更新；其他路径可能滞后 |
 
-同一段 prefix 的三份“数字”可能相等，但它们的 owner 和生命周期不同。尤其不要把 FULL.value 当成 K/V tensor；真正的 K/V 仍在 token_to_kv_pool.get_kv_buffer(layer_id)。
+`kv_committed_len` 不是“kernel 已经写完 K/V”的回执：plain 主线的 extend 分配阶段就在[`allocation.py#385-387`](../../python/sglang/srt/mem_cache/allocation.py#385-387)更新它；异常、overlap 或 speculative 路径可能再按自己的提交/回滚逻辑调整。finish 时，`effective_kv_committed_len` 决定 tree 接管到哪里，其余 overallocated 区间单独释放。
 
-![A 的 slot-ID 经树缓存复用到 B，K/V 数值仍留在 MHATokenToKVPool](assets/slot_mapping_example.svg)
+到这里，四个 owner 和四个长度/索引字段已经齐了。接下来不再介绍新对象，而是按时间顺序看它们如何接力：先 lookup 得到可复用 slot，再 admission 保护它，随后 allocation 把 prefix 和新 slot 写进 row，最后 forward 消费这张 row。
 
-## 3. Extend/decode 分配：先分 row，再分 slot
+## 3. 一条请求的源码生命周期
 
-### 3.1 Extend 的核心输入
+### 3.1 全流程先看一遍
 
-[`ScheduleBatch.prepare_for_extend()` · L2504–L2551](../../python/sglang/srt/managers/schedule_batch.py#2504-2551) 对 batch 中每条请求计算：
+```mermaid
+sequenceDiagram
+    participant R as Req
+    participant T as UnifiedRadixCache
+    participant A as PrefillAdder
+    participant B as ScheduleBatch
+    participant P as allocator + ReqToTokenPool
+    participant F as ForwardBatch
+    participant K as MHA backend/pool
+    participant S as scheduler finish path
 
-~~~text
-prefix_len = len(req.prefix_indices)
-seq_len    = req.extend_range.end
-extend_len = req.extend_range.length
-extend_num_tokens = sum(extend_len for all requests)
-~~~
+    R->>R: init_next_round_input()
+    R->>T: init_next_round_input() 内调用 match_prefix(RadixKey)
+    T-->>R: prefix_indices, last_node, protected_len
+    A->>T: accepted request: inc_lock_ref(last_node)
+    A->>B: set extend_range / build batch
+    B->>P: prepare_for_extend() → alloc_for_extend()
+    P-->>B: req_pool_indices, out_cache_loc
+    P->>P: write_cache_indices(prefix + fresh locs)
+    B->>F: ForwardBatch.init_new()
+    F->>K: backend forward
+    K->>K: set_kv_buffer(out_cache_loc, K, V)
+    K->>K: read history through row/metadata
+    K-->>R: model output
+    S->>T: release_kv_cache(is_insert=True/False)
+    alt finish and insert
+        T->>T: cache_finished_req() stores slot-ID value
+        T-->>P: free private tail and request row
+    else retract or preempt
+        T-->>P: free private slots or preserve them in host backup
+    end
+```
 
-input_ids 只取 `get_fill_ids()[prefix_len:]`，即本轮真正要计算的新 token。随后调用 [`alloc_for_extend()` · L282–L389](../../python/sglang/srt/mem_cache/allocation.py#282-389)：
+下面每节只展开一跳，不重新讲整张图。
 
-1. alloc_req_slots() 从 ReqToTokenPool 取每条请求的 row；
-2. `page_size=1` 调 `alloc_token_slots(tree_cache, extend_num_tokens)`，不足时先让 tree cache 处理短缺；`page_size>1` 调 `alloc_paged_token_slots_extend()`；
-3. write_cache_indices() 把已有 prefix 和新 slot 写回各自 row；
-4. 更新每条请求的 kv_allocated_len、kv_committed_len。
+图中 `finish` 和 `retract/preempt` 故意分开：前者可能把已提交的 slot-ID 留给 tree，后者处理仍属于运行中请求的地址，必要时做 backup。两者都经过 release 相关代码，但后续 owner 不同。
 
-写表的等价式是：
+### 3.2 lookup：`Req` 先拿到 prefix slot 向量
 
-$$
-\begin{aligned}
-\texttt{req\_to\_token}[r,0:\text{prefix\_len}]
-  &\leftarrow \texttt{prefix\_indices},\\
-\texttt{req\_to\_token}[r,\text{prefix\_len}:\text{seq\_len}]
-  &\leftarrow \texttt{out\_cache\_loc}[o:o+\text{extend\_len}].
-\end{aligned}
-$$
+**导航卡**
 
-其中 $o$ 是 batch packed 新 token 区间的起点。这里不是二维笛卡尔积：每条请求只消费自己那一段连续的 out_cache_loc。
+- 从哪里进：scheduler 的 prefill loop；请求内部进入[`Req.init_next_round_input`](../../python/sglang/srt/managers/schedule_batch.py#1390-1490)。
+- 这一段看什么：`key_limit`、`RadixKey`、`match_result.device_indices`。
+- 下一跳：`PrefillAdder.add_one_req()` 做预算和准入锁。
+- 先忽略什么：SWA reprefill、session、HiCache；它们会改变 lookup 上限或 host 状态，但不改变基本返回契约。
 
-### 3.2 Decode 只追加当前位置
+关键源码关系是：
 
-无 speculative 的 [`alloc_for_decode()` · L521–L561](../../python/sglang/srt/mem_cache/allocation.py#521-561)（入口与 row 写入）中：
+```python
+# schedule_batch.py#1419-1489，压缩展示
+token_ids_to_match = self.full_untruncated_fill_ids
+key_limit = self._compute_max_prefix_len(input_len)
+match_result = tree_cache.match_prefix(
+    MatchPrefixParams(
+        key=RadixKey(token_ids_to_match, self.extra_key,
+                    limit=key_limit, cache_salt=self.cache_salt),
+        req=self,
+    )
+)
+self.prefix_indices = match_result.device_indices
+self.last_node = match_result.last_device_node
+self.kv.cache_protected_len = (
+    match_result.cache_protected_len
+    if match_result.cache_protected_len is not None
+    else len(self.prefix_indices)
+)
+```
 
-- page_size=1：一次申请 batch_size * token_per_req 个 slot；
-- page_size>1：从 req_to_token[req_pool_indices, seq_lens-1] 取每条请求的 last_loc，交给 paged allocator；
-- decoder-only 的写位置就是旧的 seq_lens：
+`prefix_indices` 是设备上的 slot-ID 向量；它不是 K/V 数值，也不是 row。lookup 只返回“可以复用哪些地址”，不会复制 37-token 的 K/V。
 
-~~~text
-req_to_token[req_pool_indices, seq_lens] = out_cache_loc
-~~~
+**逐步读这段。** 第一行拿的是完整 token 序列，避免为了匹配 prefix 先复制一份数组；第二行通过 `_compute_max_prefix_len()` 把可匹配长度限制为 `input_len - 1`（普通路径要留下当前要预测/计算的 token）。`match_prefix()` 消费的是 token key，返回的 `device_indices` 才转成后续 attention 可用的 slot-ID。最后三行把结果写回 `Req`：`prefix_indices` 给 allocation 使用，`last_node` 给 lock 使用，`cache_protected_len` 给 finish/release 使用。
 
-然后每条请求的 allocated/committed length 都增加 token_per_req。decode 不重新做 prefix lookup；它沿用当前 row 和上一步的树锁。
+所以 lookup 的产物不是“请求已经拥有一整行 cache”，而是一个待接入的 prefix 地址向量。下一跳 admission 必须先保护它，才能安全地分配 suffix。
 
-### 3.3 Chunked prefill 的中间边界
+### 3.3 admission：找到节点不等于已经分配 row
 
-如果 `PrefillAdder` 因 token budget 只接受一部分 prompt，本轮 forward 结束后 scheduler 会调用 `maybe_cache_unfinished_req()`，最终进入 `UnifiedRadixCache.cache_unfinished_req()`。它不是 finish 的简化别名，关键步骤是：
+`PrefillAdder.add_one_req()` 先在 [`_lock_node`](../../python/sglang/srt/managers/schedule_policy.py#1024-1039) 里临时加锁做预算判断；请求真正被接受后，再由 `_req_inc_lock_ref()` 保持 `last_node` 的请求级保护，避免 allocation 期间 prefix 被 eviction。相关入口在 [`schedule_policy.py#926-932`](../../python/sglang/srt/managers/schedule_policy.py#926-932) 和 [`#1177-1352`](../../python/sglang/srt/managers/schedule_policy.py#1177-1352)。
 
-1. 从当前 request row 读取已经算出的 slot IDs，按 `page_size` 对齐后插入 tree；
-2. 对照 radix tree 再做一次 match，把 canonical 的 `new_indices` 写回 row 的未保护区间；
-3. 释放重复/未插入的 slot，先 decrement 旧 lock，再锁定新的 `last_node`；
-4. 更新 `prefix_indices`、`cache_protected_len` 和 `last_node`，但保留 request row 继续下一 chunk。
+这一步的状态变化只有：
 
-因此，SGLang 的 chunked prefill **确实会在整个 prompt 尚未 prefill 完时，把已经完成计算的对齐 chunk 插入 prefix cache**。下一轮输入仍然是 `get_fill_ids()[len(prefix_indices):]`；它可能比上一轮短，也可能从刚插入的共享节点继续。完整实现见 [`UnifiedRadixCache.cache_unfinished_req()` · L925–L1048](../../python/sglang/srt/mem_cache/unified_radix_cache.py#925-1048)，结果处理入口见 [`process_batch_result_prefill()` · L240–L346](../../python/sglang/srt/managers/scheduler_components/batch_result_processor.py#240-346)，scheduler 暂存 chunked request 的入口见 [`stash_chunked_request()` · L3252–L3253](../../python/sglang/srt/managers/scheduler.py#3252-3253) 及 [`get_next_batch_to_run()` 中的调用处 · L3368–L3379](../../python/sglang/srt/managers/scheduler.py#3368-3379)。
+| 此前 | 此后 |
+|---|---|
+| `prefix_indices` / `last_node` 已由 lookup 得到 | 命中路径被 lock，request 进入 `can_run_list` |
+| `req.kv.req_pool_idx is None` | 仍可能是 `None` |
+| 没有本轮新 slot | 仍没有本轮新 slot |
 
-### 3.4 allocator 短缺不是请求抢占
+真正分配 row 和 slot 的下一跳是 `ScheduleBatch.prepare_for_extend()`，不是 `PrefillAdder`。
 
-[`alloc_token_slots()` · L150–L170](../../python/sglang/srt/mem_cache/allocation.py#150-170) 会调用 [`evict_from_tree_cache()` · L168–L194](../../python/sglang/srt/mem_cache/common.py#168-194)。它只在可用 slot 不够时计算 shortfall，并请求 tree cache 淘汰未锁定的缓存节点。这个动作释放的是**缓存前缀**。
+**为什么要分成两步？** lookup 面向的是共享 tree，allocation 面向的是当前 batch。两者之间可能有显存压力、prefill token 预算或并发请求竞争；lock 只保证“刚刚命中的 tree 节点在这段决策期间不能被淘汰”，并不等于已经拿到了 request row。读到这里时，可以把请求记成：`prefix_indices` 已知、prefix 被保护、suffix 还没有地址。
 
-调度器为了给高优先级请求腾位置而 retract/preempt 运行中请求，走的是 release_req()/release_kv_cache(..., is_insert=False)，必要时还会做 host backup 或重新排队。这是**运行请求生命周期**，不能写成“evict 就是 preempt”。
+### 3.4 extend：一次分 row、分 slot、写 request table
 
-## 4. Forward：ForwardBatch 只携带本轮索引
+**导航卡**
 
-### 4.1 从 ScheduleBatch 到 runner
+- 从哪里进：scheduler 建好 `ScheduleBatch` 后调用[`prepare_for_extend`](../../python/sglang/srt/managers/schedule_batch.py#2504-2552)。
+- 这一段看什么：`prefix_lens`、`extend_lens`、`out_cache_loc`，以及 `alloc_for_extend()` 的三步。
+- 下一跳：`ForwardBatch.init_new()` 把这些字段带进 model runner。
+- 先忽略什么：KV reuse、DSV4-NPU、hybrid SWA 专用钩子。
 
-[`ForwardBatch` · L394–L411](../../python/sglang/srt/model_executor/forward_batch_info.py#394-411) 的核心字段集中在上述范围，[`init_new()` · L723–L800](../../python/sglang/srt/model_executor/forward_batch_info.py#723-800) 的 `ScheduleBatch` 映射在上述范围。这里给出本文 `page_size=1`、decoder-only 的典型 shape：
+`prepare_for_extend()` 先计算本轮输入和长度：
 
-| 字段 | 典型 shape / dtype | 语义 |
+```python
+# schedule_batch.py#2513-2517
+input_ids = [r.get_fill_ids()[len(r.prefix_indices):] for r in reqs]
+extend_num_tokens = sum(len(ids) for ids in input_ids)
+seq_lens = [r.extend_range.end for r in reqs]
+prefix_lens = [len(r.prefix_indices) for r in reqs]
+extend_lens = [r.extend_range.length for r in reqs]
+```
+
+随后进入[`alloc_for_extend`](../../python/sglang/srt/mem_cache/allocation.py#282-389)：
+
+```python
+# allocation.py#312-366
+req_pool_indices = alloc_req_slots(...)
+if alloc_page_size == 1:
+    out_cache_loc = alloc_token_slots(tree_cache, batch.extend_num_tokens)
+else:
+    out_cache_loc = alloc_paged_token_slots_extend(...)
+write_cache_indices(
+    out_cache_loc, req_pool_indices_device, req_pool_indices_cpu,
+    prefix_lens_device, prefix_lens_cpu, batch.seq_lens,
+    batch.seq_lens_cpu, extend_lens_device, extend_lens_cpu,
+    prefix_tensors, batch.req_to_token_pool,
+)
+```
+
+其中 `write_cache_indices()` 做的不是抽象“绑定”，而是两次写表：先把 `prefix_tensors` 写到 row 的前缀区，再把 packed 的 `out_cache_loc` 按每个请求的 `extend_len` 切片写到 suffix 区，具体见[`allocation.py#54-103`](../../python/sglang/srt/mem_cache/allocation.py#54-103)。
+
+本轮最重要的字段关系：
+
+| 字段 | 含义 | 典型 shape |
 |---|---|---|
-| input_ids | [extend_num_tokens], int64 | 本轮 extend 的新 token；decode 通常是 batch token |
-| req_pool_indices | [batch_size], int64 | 这些 batch lane 对应的 req_to_token 行 |
-| seq_lens | [batch_size], int64 | 本轮 forward 后的逻辑长度 |
-| out_cache_loc | extend 为 [extend_num_tokens]，decode 为 [batch_size]，int64 | 当前 K/V 要写入的 slot |
-| seq_lens_sum | Python 标量 | batch 序列长度和，用于 metadata |
+| `req_pool_indices` | batch lane 对应哪一行 request table | `[batch]` |
+| `prefix_lens` | 每条请求已有多少可复用 token | `[batch]` |
+| `out_cache_loc` | 本轮新 K/V 要写的 slot，按 batch packed | `[extend_num_tokens]` |
+| `req_to_token` | 全局 request table 中的 prefix + suffix 映射 | `[pool_rows, max_context_len]` |
 
-`ForwardBatch.init_new()` 还调用 `KVIndexTranslator.rebind_write_loc()`。在本文的普通 MHA pool 上这是 no-op；统一内存池、DCP 等路径会把 virtual ID 翻译成 kernel-facing ID。translator 的 [`index_table_for_batch()` · L290–L320](../../python/sglang/srt/mem_cache/kv_index_translator.py#290-320) 与 [`rebind_write_loc()` · L342–L356](../../python/sglang/srt/mem_cache/kv_index_translator.py#342-356) 分别见上述范围。
+**关键结论：** `out_cache_loc` 只包含本轮新写入的 suffix；命中的 prefix 不会再次出现在里面。
 
-对 plain pool，index_table_for_batch() 返回的本质是：
+**带读。** 这段 allocation 的顺序可以压缩成三件事：先给请求找 row，再给本轮新 token 找 slot，最后把两段地址（已有 prefix + 新 suffix）拼回 row。`prefix_lens` 决定每条请求从 packed 的 `out_cache_loc` 中切哪一段；因此 `out_cache_loc` 是 batch 级的一维数组，而 `req_to_token` 是按请求行组织的二维表。`ForwardBatch` 下一步只需要携带这两个结果，不需要重新做一次 prefix 匹配。
 
-~~~text
-ids     = req_to_token
-row_ids = req_pool_indices
-entry_page_size = 1
-~~~
+此时 K/V 数值还没有写入。allocation 只把“将来写到哪里”准备好；真正产生 K/V 并写入 `loc` 的动作要等模型 forward 经过 attention backend。
 
-也就是说 backend 可以读取 `ids[row_ids[b], 0:seq_lens[b]]`。普通 paged allocator 即使 `page_size>1`，这份 view 仍可能透传 token-slot 表，再由 backend 按 page size 构造自己的 page metadata；只有统一内存池等存在多套 ID 空间时，translator 才真正生成 translated table。关键不是“所有分页都由 translator 完成”，而是 backend 不能越过这份契约自行猜 ID 空间。
+### 3.5 decode：只追加当前位置
 
-### 4.2 RadixAttention 不负责查树
+对已经持有有效 KV、普通且非 speculative 的连续 decode 请求而言，decode 不重新做 prefix lookup。`ScheduleBatch.prepare_for_decode()` 在[`schedule_batch.py#3287-3334`](../../python/sglang/srt/managers/schedule_batch.py#3287-3334)调[`alloc_for_decode`](../../python/sglang/srt/mem_cache/allocation.py#521-584)。plain `page_size=1` 的主线是：
 
-模型层的 [`RadixAttention.forward()` · L157–L290](../../python/sglang/srt/layers/radix_attention.py#157-290) 收到 q/k/v 和 ForwardBatch 后，选择 piecewise custom op 或 `get_attn_backend().forward(...)`。prefix lookup 已经在 scheduler admission 阶段完成；attention layer 不会再次按 token hash 查 radix tree。
+```python
+# allocation.py#534-561
+out_cache_loc = alloc_token_slots(tree_cache, bs * token_per_req)
+locs = batch.seq_lens.clone()
+batch.req_to_token_pool.write(
+    (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+)
+```
 
-以 FlashInfer backend 为例：[`init_forward_metadata()` · L956–L1053](../../python/sglang/srt/layers/attention/flashinfer_backend.py#956-1053)、[`forward_extend()` · L1314–L1474](../../python/sglang/srt/layers/attention/flashinfer_backend.py#1314-1474)（本文关心的 paged 取 buffer、写 K/V 和 wrapper 调用集中在 [L1323–L1377](../../python/sglang/srt/layers/attention/flashinfer_backend.py#1323-1377)）、[`forward_decode()` · L1475–L1532](../../python/sglang/srt/layers/attention/flashinfer_backend.py#1475-1532)。
+这表示每个 request row 在旧的 `seq_len` 位置追加一个新 slot；随后 `seq_lens`、`kv_allocated_len` 和（在这条 plain 主线中）`kv_committed_len` 增加。retract 后重建 row、session/unfinished-cache 修正，以及 speculative verify 可能重新建立或修正 prefix 状态，先放到边界章节。
 
-1. init_forward_metadata() 向 KVIndexTranslator.index_table_for_batch() 要一份本 batch 的读表视图，并更新 prefill/decode wrapper 的 indptr、indices 等 metadata；
-2. forward_extend()/forward_decode() 在保存 K/V 时，用 forward_batch.out_cache_loc 调 token_to_kv_pool.set_kv_buffer(...)；
-3. paged wrapper 再按 metadata 从每个请求的 row 读取完整上下文，并执行 attention。
+decode 和 extend 的差别只在“本轮新增多少 token”：extend 通常一次为 prompt suffix 分配一段 packed slot，decode 则在每行当前长度的位置追加一个（或少量）slot。无论哪种模式，写表动作都先发生，backend 才能用新的 `out_cache_loc` 写入当前 K/V。
 
-在 paged extend 分支，源码顺序确实是“set_kv_buffer → wrapper.forward”；ragged 分支会把当前 k/v 作为输入并和已有 cache 合并，不能简单说成所有 backend 都只读 pool。Triton backend 的对应入口是 [`init_forward_metadata()` · L750–L1015](../../python/sglang/srt/layers/attention/triton_backend.py#750-1015)、[`forward_extend()` · L1334–L1823](../../python/sglang/srt/layers/attention/triton_backend.py#1334-1823) 和 [`forward_decode()` · L1824–L2030](../../python/sglang/srt/layers/attention/triton_backend.py#1824-2030)；它使用自己的 `kv_indptr/kv_indices`，但仍遵守“slot 写入由 pool 完成、读索引由 batch metadata 提供”的边界。
+### 3.6 `ForwardBatch`：把索引交给 runner，不拥有 K/V
 
-因此 kernel 通常不知道：
+`ForwardBatch` 的核心字段定义在[`forward_batch_info.py#393-411`](../../python/sglang/srt/model_executor/forward_batch_info.py#393-411)：
 
-- 哪些 token hash 相同；
-- 哪个 NodeId 持有这段 prefix；
-- lock/refcount 是否为 0；
-- 某个 slot 是刚申请的还是从 prefix 复用的。
+| 字段 | 作用 |
+|---|---|
+| `input_ids` | 本轮要计算的 token |
+| `req_pool_indices` | 去 `ReqToTokenPool` 取哪几行 |
+| `seq_lens` | 每条请求当前可见长度 |
+| `out_cache_loc` | 当前 K/V 写入哪些 slot |
+| `seq_lens_sum` | backend 构造 metadata 的长度汇总 |
 
-这些都是 scheduler、allocation 和 tree-cache 层的职责。
+`ForwardBatch.init_new()` 在[`#722-830`](../../python/sglang/srt/model_executor/forward_batch_info.py#722-830)从 `ScheduleBatch` 组装这些字段；随后在[`#830`](../../python/sglang/srt/model_executor/forward_batch_info.py#830)重新绑定本轮的 write location。它是本轮 forward 的索引快照，不是另一份 cache。
 
-## 5. 一组连续数字：A → B → C
+**带读。** 这里是 scheduler 世界和 model-runner 世界的交界：scheduler 负责决定请求行、长度和写入位置，`ForwardBatch` 把决定结果冻结成一次 forward 的输入快照。它携带构造读表所需的 `req_pool_indices + seq_lens`，以及当前 K/V 的 `out_cache_loc`；attention backend 再通过 [`KVIndexTranslator.index_table_for_batch`](../../python/sglang/srt/mem_cache/kv_index_translator.py#290-320) 生成 kernel-facing read table。表本身与 K/V backing 仍由 runner/backend 持有，因此 forward 结束后，真正需要回收的仍然是 allocator/tree 里的 slot，而不是 `ForwardBatch` 自己。
 
-下面固定 page_size=1，假设 allocator 尚未发生回收，示意 free-list 恰好按递增顺序给出 slot；真实运行中 slot ID 会因复用而不同。仍用前面的 4 层、8 KV heads、128 维 BF16 参数。
+这一步实际产出两个方向的地址：`out_cache_loc` 给“写当前 K/V”的路径，`req_pool_indices + seq_lens` 给“构造历史读取表”的路径。把两者分开，后面读 `forward_extend()` 时就不会把 write location 误认为完整的 read table。
 
-### 5.1 A：37-token prompt 首次进入
+## 4. forward：先写本轮 K/V，再读历史
 
-设 A 的 prompt 是 a[0:37]。
+### 4.1 `RadixAttention` 不查 radix tree
 
-1. input_len=37，所以 key_limit=36；树为空，prefix_indices=[]。
-2. PrefillAdder 接受请求并为它分配 row r=5。
-3. prepare_for_extend() 得到 prefix_len=0、extend_len=37，allocator 返回：
+prefix lookup 已经发生在 scheduler admission。模型层的[`RadixAttention.forward`](../../python/sglang/srt/layers/radix_attention.py#157-298)不负责再次比较 token IDs 或访问 `UnifiedTreeCore`；它把 `q/k/v` 和 `ForwardBatch` 交给统一 attention op 或具体 backend。
 
-   ~~~text
-   out_cache_loc = [1, 2, 3, ..., 37]
-   ~~~
+**导航卡**
 
-4. write_cache_indices() 写入：
+- 从哪里进：模型层 `RadixAttention.forward()`。
+- 这一段看什么：backend 的 `forward_extend/forward_decode` 接收到 `out_cache_loc` 和读表 metadata。
+- 下一跳：以 FlashInfer 为例进入 `init_forward_metadata()`、`forward_extend()` 或 `forward_decode()`。
+- 先忽略什么：Triton/FA3/TRTLLM 的 wrapper 差异；它们换 kernel metadata，但共享 pool 的写入契约。
 
-   ~~~text
-   req_to_token[5, 0:37] = [1, 2, ..., 37]
-   ~~~
+这一步是一个重要的边界：到 scheduler 为止，系统只是在组织地址；从 `RadixAttention.forward()` 开始，模型才拿着当前 token 的 `q/k/v` 真正做计算。不要把“命中了 radix prefix”理解成 attention 层又查了一遍树；attention 只消费已经整理好的 batch metadata。
 
-5. 每一层的 forward_extend() 把本层 K/V 分别写到这些 slot；37 个 token 的有效数值是 148 KiB/layer，四层合计 592 KiB。
+### 4.2 FlashInfer extend：`out_cache_loc` 写当前 K/V
 
-假设 A 的 kv_len_to_handle=37 并正常完成，release_kv_cache() 调 UnifiedRadixCache.cache_finished_req()。树把 token key 和 req_to_token[5,0:37] 的 **clone** 插入 FULL.value，然后 row 5 归还给 ReqToTokenPool。此时 [1..37] 仍由树拥有，不能回到 allocator free-list；K/V backing 也没有缩小。
+FlashInfer 的[`forward_extend`](../../python/sglang/srt/layers/attention/flashinfer_backend.py#1314-1472)在 paged 分支的顺序很直白：
 
-> 初次 lookup 的 input_len-1 限制只影响“本轮可复用多少”；完成时缓存已提交的序列可以把这 37 个 token 登记进树。
+```python
+# flashinfer_backend.py#1341-1377
+pool = self.token_to_kv_pool
+kv_cache = pool.get_kv_buffer(layer.layer_id)
+if k is not None and save_kv_cache:
+    self.token_to_kv_pool.set_kv_buffer(
+        layer,
+        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+        k,
+        v,
+        *self._kv_write_scales(layer),
+    )
+o = prefill_wrapper_paged.forward(q, kv_cache, ...)
+```
 
-### 5.2 B：A 的 37-token 前缀后再接一个 token
+这里 `cache_loc` 来自 `forward_batch.out_cache_loc`（普通 self-attention 分支见[`#1326-1330`](../../python/sglang/srt/layers/attention/flashinfer_backend.py#1326-1330)）。因此当前 token 的 K/V 先写进 pool，wrapper 才按 metadata 读完整历史。ragged 分支会把当前 K/V 作为输入合并，不能把“所有 backend 都只读 pool”当成普遍规律。
 
-B 的 prompt 是 a[0:37] + [b37]，总长 38。
+**逐行抓重点。** `get_kv_buffer()` 先拿到当前 layer 的 backing；`set_kv_buffer()` 用 allocation 阶段传下来的 `cache_loc` 写入当前这一批 K/V；`prefill_wrapper_paged.forward()` 随后用读表和长度 metadata 读取 prefix 加 suffix。也就是说，同一个 token 在这段代码中经过了两个不同接口：写入接口接收 `out_cache_loc`，读取接口接收 kernel-facing 的 index table。两者都指向同一块 pool，但职责不同。
 
-1. key_limit=38-1=37，所以 lookup 可以完整命中 A 的 37-token node：
+### 4.3 FlashInfer decode：同一契约，写入长度不同
 
-   ~~~text
-   prefix_indices = [1, 2, ..., 37]
-   cache_protected_len = 37
-   ~~~
+[`forward_decode`](../../python/sglang/srt/layers/attention/flashinfer_backend.py#1474-1531)仍然先调用 `set_kv_buffer()`（[`#1493-1502`](../../python/sglang/srt/layers/attention/flashinfer_backend.py#1493-1502)），然后拿 `get_kv_buffer()`（[`#1517-1519`](../../python/sglang/srt/layers/attention/flashinfer_backend.py#1517-1519)）交给 decode wrapper（[`#1521-1529`](../../python/sglang/srt/layers/attention/flashinfer_backend.py#1521-1529)）。差别只是 decode 通常每个 request 每轮追加一个位置，`out_cache_loc` 的 shape 从 packed extend 长度变成 batch 级长度。
 
-2. B 获得另一个 row，例如 r=6；extend_len=1，allocator 只给一个新 slot：
+因此可以把 extend/decode 共同契约记成一句话：**先用本轮写地址落地 K/V，再用读表把完整上下文交给 kernel；变化的是批量形状，不是 owner 关系。**
 
-   ~~~text
-   out_cache_loc = [38]
-   req_to_token[6, 0:38] = [1, 2, ..., 37, 38]
-   ~~~
+### 4.4 backend 如何拿到读表
 
-3. attention 只把 b37 的 K/V 写到 slot 38，但读取时通过 B 的 row 看到前 37 个共享 slot 加这个新 slot。没有发生 37-token 的 K/V memcpy。
+`init_forward_metadata()` 会向 `KVIndexTranslator.index_table_for_batch()` 要 kernel-facing 的读表；translator 的入口见[`kv_index_translator.py#290-320`](../../python/sglang/srt/mem_cache/kv_index_translator.py#290-320)。普通 pool 可能直接透传 `req_to_token` 的 token IDs；统一内存、DCP 或 paged backend 才需要进一步翻译或展开。
 
-如果 B 只是一个长度也为 37 的重复 prompt，key_limit=36，命中会停在 [1..36]，最后一个 token 仍需重新计算。这是源码里保留 logits 位置的直接结果。
+因此 backend 通常不知道：
 
-### 5.3 C：前 20 个相同，之后分叉
+- token hash 是否命中；
+- 哪个 radix `NodeId` 拥有 prefix；
+- lock/refcount 是否为零；
+- 某个 slot 是刚申请的还是 prefix 复用的。
 
-设 C 长度为 25，前 20 个 token 与 A 相同，后 5 个为 c[20:25]。
+它只消费本轮 metadata 和 K/V buffer。
 
-1. key_limit=24，radix walk 在位置 20 分叉，返回 prefix_indices=[1..20]。
-2. C 取 row r=7，extend_len=5，示意 allocator 给出 [39..43]：
+这也是为什么 debug 时要沿两个方向分别追：如果当前 token 的数值不对，先查 `set_kv_buffer()` 和 `out_cache_loc`；如果历史长度或读取范围不对，查 `req_to_token`、`seq_lens` 和 `KVIndexTranslator`。不要一看到 attention 输出错误就直接跳进 kernel。
 
-   ~~~text
-   req_to_token[7, 0:25] = [1, ..., 20, 39, 40, 41, 42, 43]
-   ~~~
+## 5. 一个受控但真实的状态 trace
 
-3. lookup/insert 共同完成在 token 20 处分支：如果旧 node 还未切分，match_prefix() 会先切分，完成时 insert 再创建 child；已有共享前缀继续由父节点持有，C 的新 suffix 由 child 的 FULL.value 持有。Unified insert 对重叠区间产生的 duplicate/free action 会交回 allocator，不能凭“看起来是同一段”手工再 free 一次。
+这一节用小数字模拟源码的 plain `page_size=1` 路径。数字是人为固定的 free-list 初态，不代表所有部署都会得到同样的 row/slot 编号。
 
-这三个请求把“复用 prefix”和“申请新 token”分开了：A 申请 37，B 只申请 1，C 只申请 5；batch 汇总时才把各请求的新增长度拼成一个 out_cache_loc。
+### 5.1 固定条件
 
-![请求 B 从 prefix 命中、加锁、分配 slot 到完成或释放的生命周期](assets/request_lifecycle.svg)
+| 项目 | 本例设定 |
+|---|---|
+| request rows | `[1,2,3,4]` 可用；row 0 dummy；`ReqToTokenPool.alloc_rows()` 从尾部取 |
+| KV slots | `[1,2,...]` 可用；slot 0 dummy；`TokenToKVPoolAllocator.alloc()` 从前部取 |
+| page | `page_size=1`，不引入 page-table 分支 |
+| 请求 | A 长度 5；B 与 A 前 5 个 token 相同并追加 1 个；C 与 A 前 2 个 token 相同，之后分叉并有 2 个新 token |
+| 调度 | A 先完成；B/C 在同一个 extend batch；无 eviction、无 chunk |
 
-图 2 把同一组数字放回时间轴：命中只产生 `[1…37]`，本轮分配只产生 `[38]`；完成时树 clone slot-ID 并释放 row，显存短缺和运行请求撤回则分别走 eviction 与 `release_req(is_insert=False)`。
+### 5.2 Checkpoint 1：A lookup 后
 
-### 5.4 把 page_size 改成 16 会发生什么
+`A` 的 `input_len=5`，普通 prefix lookup 会按 `key_limit` 留出最后一个 token；树为空，所以：
 
-这是可选分支，不改变上面的所有权关系：
+| 字段 | 值 |
+|---|---|
+| `prefix_indices` | `[]` |
+| `extend_range` | `[0,5)` |
+| `last_node` | root/empty match |
+| lock | 没有可保护的 prefix |
 
-- RadixKey.page_aligned(16) 向下取整；
-- 长度 37 的 A 完成插入时，树最多登记前 32 个 token；未对齐的尾 5 个 slot 按 cache_finished_req() 的 tail 规则释放；
-- 长度 38 的 B lookup 的上限是 37，再向下对齐后仍最多命中 32，extend 部分是 6 个 token；
-- allocator 按 page ID 申请，返回的扁平 slot 可能形如 page_id*16 + offset；page ID、逻辑 page 和 slot 不是同一概念。
+入口是[`Req.init_next_round_input`](../../python/sglang/srt/managers/schedule_batch.py#1390-1490)，准入随后进入 `PrefillAdder.add_one_req()`。
 
-所以 page-aware 路径的“缓存边界”是页对齐的，而 `kv_allocated_len/kv_committed_len` 仍以请求 token 长度记录。需要同时看 [`RadixKey` · L59–L235](../../python/sglang/srt/mem_cache/radix_cache.py#59-235)、[paged allocator · L105–L271](../../python/sglang/srt/mem_cache/allocator/paged.py#105-271) 和 [`allocation.py` · L150–L389](../../python/sglang/srt/mem_cache/allocation.py#150-389)，不要只看一个数组猜全链路。
+此刻 A 只有“逻辑输入”和一个空的匹配结果，还没有 request row，也没有新 slot。这个 checkpoint 的意义是把 lookup 和 allocation 分开：树为空并不代表 allocator 已经运行，只代表下一轮需要为全部 5 个 token 申请新地址。
 
-## 6. 完成、释放、淘汰：三种动作三种 owner
+### 5.3 Checkpoint 2：A allocation 与 forward 后
 
-### 6.1 请求完成：树接管 slot-ID 副本
+`alloc_for_extend()` 先取一个 row，再取 5 个新 slot：
 
-普通完成路径由 [`release_kv_cache()` · L254–L296](../../python/sglang/srt/mem_cache/common.py#254-296) 串起来：
+| 状态 | 值 |
+|---|---|
+| `req_pool_idx(A)` | `4`（从 `[1,2,3,4]` 尾部取） |
+| `out_cache_loc` | `[1,2,3,4,5]` |
+| `req_to_token[4,:5]` | `[1,2,3,4,5]` |
+| `ForwardBatch.out_cache_loc` | `[1,2,3,4,5]` |
+| forward 写入 | 每个 Full Attention layer 的 K/V buffer 对应这些 slot |
 
-~~~text
-effective_kv_committed_len
-  → tree_cache.cache_finished_req(req, kv_len_to_handle=...)
-    → 复制/插入已提交 prefix 的 slot IDs
-    → 释放 unaligned tail、duplicate 或未插入区间
-  → 释放可能过分配的 [committed_len, allocated_len)
-  → req_to_token_pool.free(req)
-~~~
+backend 写完 K/V 后，A 完成；`release_kv_cache(is_insert=True)` 把这段 slot-ID 的副本交给 tree。此时 row 4 可以归还，但 slots 1–5 仍被 tree 引用。
 
-[`cache_finished_req()` · L838–L924](../../python/sglang/srt/mem_cache/unified_radix_cache.py#838-924) 的实现见上述范围。它从 request row 读 slot IDs，构造 `RadixKey`，把 values 复制给 tree；它不会把 K/V 数值复制进树。因而完成后：
+这里第一次出现两个并行生命周期：A 的 row 是临时工作区，随着请求结束可以释放；A 的 slot 可能因为被 tree 接管而继续存活。之后 B 命中 A 时，复用的正是 `[1,2,3,4,5]` 这串地址，而不是重新计算或复制一份 K/V。
 
-- request row 可以立即给下一个请求；
-- 树节点仍保留 slot-ID，直到它被淘汰；
-- K/V pool 的固定 backing 继续存在；
-- 只有 allocator 收到 free slot/page 后，地址才可被新请求覆盖。
+### 5.4 Checkpoint 3：B/C lookup 与同批 allocation
 
-### 6.2 retract/preempt：释放运行请求，不插入树
+假设 A 的 prefix entry 仍在 device、未被淘汰：
 
-调度器的 [`release_req()` · L3158–L3172](../../python/sglang/srt/managers/schedule_batch.py#3158-3172) 为 retraction 调 `release_kv_cache(..., is_insert=False)`，随后可能把请求 reset 并重新排队。decode disaggregation 还可能先把 KV backup 到 host。这里的目标是释放请求私有的 row/slot 或保存恢复所需状态，不是构造新的 prefix-cache entry。
+| 请求 | token 关系 | `prefix_indices` | `extend_lens` |
+|---|---|---|---:|
+| B | `A@0..A@4, B@5` | `[1,2,3,4,5]` | 1 |
+| C | `A@0,A@1,C@2,C@3` | `[1,2]` | 2 |
 
-因此阅读日志时要问“谁拥有这段 slot”：
+`ScheduleBatch.prepare_for_extend()` 把两条 suffix packed 成 3 个 token；一次 `alloc_for_extend()` 取两个 request row 和三个 KV slots：
 
-| 动作 | 主要释放/改变 | 树是否新增 entry |
+| 字段 | 值 |
+|---|---|
+| `req_pool_indices` | `[3,4]`（row 4 被复用，但它不等于 A 的旧 K/V slot） |
+| `out_cache_loc` | `[6,7,8]` |
+| `req_to_token[3,:6]`（B） | `[1,2,3,4,5,6]` |
+| `req_to_token[4,:4]`（C） | `[1,2,7,8]` |
+| packed `input_ids` | `[B@5,C@2,C@3]` |
+
+这一轮 forward 只把 slot 6–8 写入 K/V pool；prefix 的 slot 1–5 由各自 row 读取，不发生 5-token K/V copy。
+
+这就是 prefix reuse 在代码层面的最小证据：B/C 的 `out_cache_loc` 只有新 suffix，旧 prefix 只通过 `write_cache_indices()` 写进各自 row。于是 batch 可以把不同请求的 suffix packed 在一起，同时让每条请求沿自己的 row 读取共享前缀。
+
+### 5.5 Checkpoint 4：B/C 完成后
+
+tree 的逻辑关系可以用状态图表示：
+
+```mermaid
+flowchart TD
+    ROOT["root"] --> P["共享 prefix A@0..A@1<br/>FULL.value = [1,2]"]
+    P --> ATAIL["A@2..A@4<br/>FULL.value = [3,4,5]"]
+    ATAIL --> B["B@5<br/>FULL.value = [6]"]
+    P --> C["C@2..C@3<br/>FULL.value = [7,8]"]
+```
+
+图里的 `FULL.value` 仍是 slot-ID tensor；K/V 数值一直在 `MHATokenToKVPool`。B/C 的 request rows 可以释放，tree 继续保护它们引用的 slots，直到 eviction。
+
+如果你要在 debug 中验证这张图，不要只打印 tree node；同时打印 `req.kv.req_pool_idx`、`req_to_token[row, :seq_len]` 和 allocator 的 free list。三者分别对应请求工作区、地址映射和可用地址，缺一项都可能把“row 被复用”误判成“K/V 被覆盖”。
+
+## 6. 完成、chunk、eviction：三种状态变化不要混写
+
+### 6.1 finish：tree 接管 slot-ID，pool 不复制 bytes
+
+**导航卡**
+
+- 从哪里进：结果处理器或 decode finish state。
+- 这一段看什么：`release_kv_cache()` 的 `is_insert`、`kv_len_to_handle`，以及 `cache_finished_req()` 的 `req_to_token` 读取。
+- 下一跳：tree insert 后释放未对齐尾部、过分配区间和 request row。
+
+[`release_kv_cache`](../../python/sglang/srt/mem_cache/common.py#254-297)的核心顺序：
+
+```python
+# common.py#269-296
+effective_kv_committed_len = req.effective_kv_committed_len()
+tree_cache.cache_finished_req(
+    req,
+    is_insert=is_insert and not req.skip_radix_cache_insert,
+    kv_len_to_handle=effective_kv_committed_len,
+)
+_release_overallocated_kv_indices(...)
+tree_cache.req_to_token_pool.free(req)
+req.kv.mark_kv_released()
+```
+
+`UnifiedRadixCache.cache_finished_req()` 先从 request row 取 token IDs 和 slot IDs（[`#850-854`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#850-854)），再把 `kv_indices[:page_aligned_len].to(..., copy=True)` 放进 `insert_params.value`（[`#858-896`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#858-896)）。这就是“tree 接管地址引用”的准确含义：复制的是 slot-ID tensor，不是 K/V bytes。
+
+**带读。** `release_kv_cache()` 先根据 `effective_kv_committed_len` 决定哪些逻辑位置已经值得缓存；tree 插入时构造 `RadixKey`，并复制 slot-ID value，未对齐尾部及 overallocated 区间随后交还 allocator，最后 request row 才释放。顺序不能反过来：如果先归还 row，tree 就无法从 row 读取要接管的 slot-ID；如果先释放 slot，tree 保存的地址又会立即失效。
+
+### 6.2 chunked prefill：中间结果也可能进树
+
+chunked prefill 不必放进主线，但要记住它不是 finish 的简单别名：
+
+- 入口：[`maybe_cache_unfinished_req`](../../python/sglang/srt/mem_cache/common.py#161-165) → [`cache_unfinished_req`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#925-1048)；
+- 它插入已经计算完成且 page-aligned 的前缀；
+- 插入后会重新 `match_prefix()`，把 canonical `new_indices` 写回 request row（[`#993-1008`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#993-1008)）；
+- 旧 lock 释放、新的 last node 重新加锁（[`#1010-1037`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#1010-1037)）。
+
+### 6.3 eviction ≠ retract/preempt
+
+| 动作 | 作用对象 | 是否插入 tree |
 |---|---|---|
 | prefix hit | 请求复用已有 slot-ID | 否 |
-| request finish | 请求私有尾部 + row；树接管已插入 prefix 的 slot-ID clone | 通常是 |
-| retract/preempt | 运行请求的私有 slot/row，可能 host backup | 否（is_insert=False） |
-| cache eviction | 未锁定 tree node 的 slot/page | 删除或 tombstone 该缓存值 |
+| finish | request 私有尾部释放；已提交 prefix 交给 tree | 通常是 |
+| eviction | lock=0 的 tree cache node，归还其 slot/page | 删除/失效已有 entry |
+| retract/preempt | 正在运行的 request row/私有 slot，必要时做 host backup | 否，通常 `is_insert=False` |
 
-### 6.3 显存短缺：evict_for_alloc
+slot 不够时，[`alloc_token_slots`](../../python/sglang/srt/mem_cache/allocation.py#150-170)先调用[`evict_from_tree_cache`](../../python/sglang/srt/mem_cache/common.py#168-195)，只把 allocator 的 shortfall 交给 `tree_cache.evict_for_alloc()`。这不是调度器抢占运行请求。运行请求的释放入口是[`ScheduleBatch.release_req`](../../python/sglang/srt/managers/schedule_batch.py#3158-3172)。
 
-[`evict_from_tree_cache()` · L168–L194](../../python/sglang/srt/mem_cache/common.py#168-194) 先看 allocator 的 `available_size()`，只把 shortfall 传给 `tree_cache.evict_for_alloc(EvictParams(...))`；Unified wrapper 的入口见 [`UnifiedRadixCache.evict_for_alloc()` · L566–L639](../../python/sglang/srt/mem_cache/unified_radix_cache.py#566-639)。Unified cache 再让 `FullComponent` 找可淘汰的 device leaf：
+读这张表时可以只问一个问题：这个动作当前针对的是“共享 tree entry”还是“仍在运行的 request”？前者是 eviction，后者是 retract/preempt；只有 finish 的正常 insert 路径会把已提交的 slot-ID 放进 tree。把这三种动作混成一个“释放 cache”函数，是调试生命周期问题时最常见的误区。
 
-1. lock 为 0 的节点才可能进入 evictable 集合；
-2. FullComponent.evict_component() 把该节点的 slot-ID tensor 交给 allocator；
-3. tree core 将 device value 置空/移除相应叶子状态；
-4. 同一个 slot 随后可被 allocator 重新发给新请求。
+## 7. 主线之外的分支：只知道入口即可
 
-如果启用 HiCache，节点可能只从 device 被淘汰、host value 仍在，状态会变成 tombstone/host-backed；这超出本文的 device-only 主线。无论哪种实现，固定 K/V backing tensor 都不会因为一次 eviction “缩容”。
-
-## 7. 读源码时必须守住的 invariant
-
-1. **row ID ≠ slot ID**：req_pool_idx 是 req_to_token 行；out_cache_loc/prefix_indices 是 K/V slot。
-2. **tree value ≠ K/V bytes**：FULL.value 是复制的 int64 slot 向量；数值只在 MHATokenToKVPool。
-3. **slot 0 是 dummy**：真实 allocator slot/page 从 1 开始，padding 写入可落到保留位置。
-4. **lookup 上限是 input_len-1**：重复完整 prompt 不一定返回全长 hit。
-5. **out_cache_loc 只代表本轮新增写入**：extend 是 packed suffix，decode 通常是一请求一个位置；prefix 复用不会再次出现在其中。
-6. **cache_protected_len 不等于“所有 row slot 都被树拥有”**：page>1、SWA 或 host tier 可能留下 partial/非 device 区间。
-7. **page 申请和 slot 寻址可切换**：看到 free_pages 不代表 kernel 一定接收 page ID；translator/backend 可能再展开成 token IDs。
-8. **match 不等于 lock**：match_prefix() 返回候选，准入时的 PrefillAdder._req_inc_lock_ref() 才把路径保护起来。
-9. **eviction 不等于 preemption**：前者淘汰缓存节点，后者释放/备份运行请求并可能重算。
-10. **不要让 backend 自己猜 ID 空间**：普通 pool 可直接透传；统一 pool/DCP 必须经过 KVIndexTranslator。
-
-遇到“第二个相同请求没有完全命中”时，按这个顺序排查：
-
-~~~text
-token IDs 是否真的相同
-→ extra_key/cache_salt 是否相同
-→ key_limit 是否因 input_len-1 或 logprob 被截断
-→ page_size 是否把长度向下对齐
-→ FULL node 的 value 是否仍在 device
-→ 请求是否在 match 后被 PrefillAdder 接受并加锁
-~~~
-
-## 8. 源码导航：建议按这个顺序打开
-
-下面的范围不是说函数只做这一件事，而是标出与本文主线直接相关、值得先读的代码。VS Code 可用 `Ctrl+G` 输入起始行；源码变动后按“入口”列的符号名搜索。
-
-| 层 | 文件 | 入口（链接标题已含行号） |
+| 分支 | 主线变化 | 先看哪里 |
 |---|---|---|
-| page 默认值 | `overrides.py` | [`_page_size_default()` · L1377–L1399](../../python/sglang/srt/arg_groups/overrides.py#1377-1399) |
-| 启动/调度 | `scheduler.py` | [`init_memory_pools()` · L1020–L1033](../../python/sglang/srt/managers/scheduler.py#1020-1033)；[`init_model_worker()` · L1047–L1060](../../python/sglang/srt/managers/scheduler.py#1047-1060)；[`stash_chunked_request()` · L3252–L3253](../../python/sglang/srt/managers/scheduler.py#3252-3253)；[`get_next_batch_to_run()` · L3342–L3379](../../python/sglang/srt/managers/scheduler.py#3342-3379)；[`run_batch()` · L4020–L4092](../../python/sglang/srt/managers/scheduler.py#4020-4092) |
-| worker | `tp_worker.py` | [`alloc_memory_pool()` · L407–L433](../../python/sglang/srt/managers/tp_worker.py#407-433)；[`init_attention_backends()` · L435–L439](../../python/sglang/srt/managers/tp_worker.py#435-439) |
-| runner 的 pool 接线 | `model_runner.py` | [`init_kv_index_translator()` · L869–L879](../../python/sglang/srt/model_executor/model_runner.py#869-879)；[`alloc_memory_pool()` · L881–L907](../../python/sglang/srt/model_executor/model_runner.py#881-907) |
-| 容量/池构造 | `kv_cache_configurator.py` | [`configure()` · L296–L329](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#296-329)；[`_build_req_to_token_pool()` · L938–L966](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#938-966)；[`_build_mha_kv_pool()` · L1796–L1830](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1796-1830)；[`_build_token_to_kv_pool_allocator()` · L1832–L1945](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1832-1945) |
-| 容量公式 | `pool_configurator.py` | [`DefaultPoolConfigurator._compute_cell_size()` · L248–L362](../../python/sglang/srt/model_executor/pool_configurator.py#248-362)；[普通 MHA 公式 · L338–L345](../../python/sglang/srt/model_executor/pool_configurator.py#338-345) |
-| request row | `memory_pool.py` | [`ReqToTokenPool` · L257–L337](../../python/sglang/srt/mem_cache/memory_pool.py#257-337) 的建表、alloc/release |
-| K/V 数值池 | `memory_pool.py` | [`MHATokenToKVPool` · L1809–L1931](../../python/sglang/srt/mem_cache/memory_pool.py#1809-1931)；[buffer 创建 · L2099–L2163](../../python/sglang/srt/mem_cache/memory_pool.py#2099-2163)；[`set_kv_buffer()` · L2381–L2460](../../python/sglang/srt/mem_cache/memory_pool.py#2381-2460) |
-| token allocator | `token.py` | [`TokenToKVPoolAllocator.alloc/free` · L28–L75](../../python/sglang/srt/mem_cache/allocator/token.py#28-75) |
-| paged allocator | `paged.py` | [`alloc()` · L149–L170](../../python/sglang/srt/mem_cache/allocator/paged.py#149-170)；[`alloc_extend()` · L172–L220](../../python/sglang/srt/mem_cache/allocator/paged.py#172-220)；[`alloc_decode()` · L222–L259](../../python/sglang/srt/mem_cache/allocator/paged.py#222-259)；[`free()` · L261–L271](../../python/sglang/srt/mem_cache/allocator/paged.py#261-271) |
-| tree 构造 | `kv_cache_builder.py` | [`build_kv_cache()` · L197–L370](../../python/sglang/srt/mem_cache/kv_cache_builder.py#197-370) |
-| tree 实现选择 | `registry.py` | [`default_radix_cache_factory()` · L80–L143](../../python/sglang/srt/mem_cache/registry.py#80-143)；[`_create_unified_radix_cache()` · L146–L196](../../python/sglang/srt/mem_cache/registry.py#146-196)；[component 选择 · L158–L165](../../python/sglang/srt/mem_cache/registry.py#158-165) |
-| token key | `radix_cache.py` | [`RadixKey` · L59–L85](../../python/sglang/srt/mem_cache/radix_cache.py#59-85)；[`match()` · L181–L215](../../python/sglang/srt/mem_cache/radix_cache.py#181-215)；[`child_key()` · L217–L229](../../python/sglang/srt/mem_cache/radix_cache.py#217-229)；[`hash_page()` · L231–L235](../../python/sglang/srt/mem_cache/radix_cache.py#231-235) |
-| tree wrapper API | `unified_radix_cache.py` | [`match_prefix()` · L523–L539](../../python/sglang/srt/mem_cache/unified_radix_cache.py#523-539)；[`insert()` · L544–L561](../../python/sglang/srt/mem_cache/unified_radix_cache.py#544-561)；[`evict_for_alloc()` · L566–L639](../../python/sglang/srt/mem_cache/unified_radix_cache.py#566-639)；[`cache_finished_req()` · L838–L924](../../python/sglang/srt/mem_cache/unified_radix_cache.py#838-924)；[`cache_unfinished_req()` · L925–L1048](../../python/sglang/srt/mem_cache/unified_radix_cache.py#925-1048) |
-| tree 结构/匹配 | `unified_tree_core.py` | [`UnifiedTreeNode` · L108–L157](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#108-157)；[`match_prefix()` · L698–L723](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#698-723)；[`_match_prefix_helper()` · L725–L810](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#725-810) |
-| tree 插入 | `unified_tree_core.py` | [`begin_insert()` · L927–L968](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#927-968)；[`_insert_walk_step()` · L1018–L1059](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#1018-1059)；[`_add_new_node()` · L1212–L1231](../../python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py#1212-1231) |
-| Full component | `full_component.py` | [match validator · L105–L140](../../python/sglang/srt/mem_cache/unified_cache/components/full_component.py#105-140)；[value clone · L142–L158](../../python/sglang/srt/mem_cache/unified_cache/components/full_component.py#142-158)；[evict · L160–L230](../../python/sglang/srt/mem_cache/unified_cache/components/full_component.py#160-230)；[lock/unlock · L263–L344](../../python/sglang/srt/mem_cache/unified_cache/components/full_component.py#263-344) |
-| 请求 lookup 状态 | `schedule_batch.py` | [`ReqKvInfo` · L849–L903](../../python/sglang/srt/managers/schedule_batch.py#849-903)；[`get_fill_ids()` · L1366–L1367](../../python/sglang/srt/managers/schedule_batch.py#1366-1367)；[`init_next_round_input()` · L1390–L1489](../../python/sglang/srt/managers/schedule_batch.py#1390-1489) |
-| batch 分配入口 | `schedule_batch.py` | [`prepare_for_extend()` · L2504–L2551](../../python/sglang/srt/managers/schedule_batch.py#2504-2551)；[`release_req()` · L3158–L3172](../../python/sglang/srt/managers/schedule_batch.py#3158-3172)；[`prepare_for_decode()` · L3287–L3334](../../python/sglang/srt/managers/schedule_batch.py#3287-3334) |
-| 准入与锁 | `schedule_policy.py` | [`PrefillAdder._req_inc_lock_ref()` · L926–L932](../../python/sglang/srt/managers/schedule_policy.py#926-932)；[`add_one_req()` · L1177–L1330](../../python/sglang/srt/managers/schedule_policy.py#1177-1330) |
-| 分配写表 | `allocation.py` | [`write_cache_indices()` · L54–L103](../../python/sglang/srt/mem_cache/allocation.py#54-103)；[token/paged/row alloc · L150–L270](../../python/sglang/srt/mem_cache/allocation.py#150-270)；[`alloc_for_extend()` · L282–L389](../../python/sglang/srt/mem_cache/allocation.py#282-389)；[`alloc_for_decode()` · L521–L561](../../python/sglang/srt/mem_cache/allocation.py#521-561) |
-| chunk 结果处理 | `batch_result_processor.py` | [`process_batch_result_prefill()` · L240–L346](../../python/sglang/srt/managers/scheduler_components/batch_result_processor.py#240-346) |
-| forward 元数据 | `forward_batch_info.py` | [`ForwardBatch` · L394–L411](../../python/sglang/srt/model_executor/forward_batch_info.py#394-411)；[`init_new()` · L723–L800](../../python/sglang/srt/model_executor/forward_batch_info.py#723-800) |
-| ID 翻译 | `kv_index_translator.py` | [`index_table_for_batch()` · L290–L320](../../python/sglang/srt/mem_cache/kv_index_translator.py#290-320)；[`rebind_write_loc()` · L342–L356](../../python/sglang/srt/mem_cache/kv_index_translator.py#342-356) |
-| attention 入口 | `radix_attention.py` | [`RadixAttention.forward()` · L157–L290](../../python/sglang/srt/layers/radix_attention.py#157-290) |
-| FlashInfer 例子 | `flashinfer_backend.py` | [`init_forward_metadata()` · L956–L1053](../../python/sglang/srt/layers/attention/flashinfer_backend.py#956-1053)；[`forward_extend()` · L1314–L1474](../../python/sglang/srt/layers/attention/flashinfer_backend.py#1314-1474)；[`forward_decode()` · L1475–L1532](../../python/sglang/srt/layers/attention/flashinfer_backend.py#1475-1532) |
-| Triton 例子 | `triton_backend.py` | [`init_forward_metadata()` · L750–L1015](../../python/sglang/srt/layers/attention/triton_backend.py#750-1015)；[`forward_extend()` 及分支 · L1334–L1823](../../python/sglang/srt/layers/attention/triton_backend.py#1334-1823)；[`forward_decode()` · L1824–L2030](../../python/sglang/srt/layers/attention/triton_backend.py#1824-2030) |
-| 完成/回收 | `common.py` | [`maybe_cache_unfinished_req()` · L161–L165](../../python/sglang/srt/mem_cache/common.py#161-165)；[`evict_from_tree_cache()` · L168–L194](../../python/sglang/srt/mem_cache/common.py#168-194)；[`release_kv_cache()` · L254–L296](../../python/sglang/srt/mem_cache/common.py#254-296) |
+| `page_size>1` | page 申请与 token-slot 寻址分开，backend 需要 page table/offset | [`alloc_paged_token_slots_extend`](../../python/sglang/srt/mem_cache/allocation.py#173-220)、[`PagedTokenToKVPoolAllocator`](../../python/sglang/srt/mem_cache/allocator/paged.py#105-271) |
+| KV index translation | 普通 pool 可透传 ID；unified/DCP 需要 kernel-facing 翻译 | [`KVIndexTranslator.index_table_for_batch`](../../python/sglang/srt/mem_cache/kv_index_translator.py#290-320) |
+| 其他 attention backend | wrapper metadata 和 kernel 调用不同，但仍消费 `out_cache_loc`/读表并调用 pool | [`TritonAttnBackend.forward_extend`](../../python/sglang/srt/layers/attention/triton_backend.py#1334-1823) |
+| speculative decode | draft/verify 有临时 slot、接受/回滚状态 | 先看 `spec_prepare_for_decode`，不要套用普通 decode trace |
+| hybrid SWA/Mamba、HiCache | 多 component、环形窗口或 host tier | 从 configurator 的 hybrid 分支进入 |
 
-### 8.1 旧版 RadixCache 放在哪里
+不要先把这些分支混进 plain MHA 的每个箭头里；先把 row/slot/KV/tree 四个 owner 走通。
 
-[`旧版 RadixCache · L303–L863`](../../python/sglang/srt/mem_cache/radix_cache.py#303-863) 仍值得读：它把 `RadixKey`、page 对齐、slot vector 和 lock 的基本语义写得更短；但当前 registry 的 plain-MHA 默认分支是 `UnifiedRadixCache`，且显式 backend、实验性 C++ tree、LMCache/FlexKV、禁用 radix cache 都可能改变实现。阅读旧类时只抽取契约，不要把 `TreeNode` 对象、字段名或调用顺序直接当成当前默认实现。
+这些分支不是主线的反例，而是对同一契约的替换：可能换 allocator、换 pool layout、增加 host tier，或改变 forward metadata。等主线跑通后，再从表格里的入口切进去，会比一开始把所有条件分支展开更容易定位。
 
-## 9. 明确不在本课主线的分支
+### 7.1 外部参考图：paged KV 的 page-table 视角
 
-- hybrid SWA/Mamba：多个 component、独立窗口/状态池和额外 lock；
-- MLA/DSA：KV 形状、压缩状态或 indexer 不再是普通 MHA 公式；
-- page_size>1、DCP/CP：页对齐、virtual/physical/kernel-facing ID 翻译；
-- speculative decode：draft/verify、临时 slot 和接受/回滚；
-- HiCache、LMCache、FlexKV、disaggregation：host/storage tier、异步 transfer、tombstone；
-- 量化 KV、HND、ROCm vectorized-5d：buffer shape 和写入 kernel；
-- 自定义/实验性 radix backend：registry 可能返回非 unified 实现。
+![FlashInfer paged KV layout](assets/flashinfer_paged_kv_layout.png)
 
-这些分支共享“请求表 → KV pool → attention metadata”的大方向，但不能把本文 `page_size=1` 的数组和释放时机照抄过去。
+这张图来自 [FlashInfer 的 KV-cache layout 文档](https://docs.flashinfer.ai/tutorials/kv_layout.html)，展示 `page_indices`、`last_page_len`、`kv_indptr` 和物理 page 的对应关系；原图资产来自 [flashinfer-ai/web-data](https://github.com/flashinfer-ai/web-data/blob/d7cc3d229f23d7c0a81c1e45d8591f4337c18efb/tutorials/page_layout.png)，仓库采用 [Apache-2.0](https://github.com/flashinfer-ai/web-data/blob/d7cc3d229f23d7c0a81c1e45d8591f4337c18efb/LICENSE)。它是外部实现的 page-level 对照图，不是 SGLang 本文 `page_size=1` 主线的运行截图：在本文主线上，可以把“page 内 token offset”退化成单 token slot，但“逻辑位置 → 物理地址 → kernel 读取”这个关系仍然相同。
 
-## 10. 自测：不看注释也能回答这些问题
+读图时只抓三件事：左侧是物理 KV 数据，右侧表格是每个 request 的 page 目录，底部数组是 kernel 使用的压缩索引。回到本文，`ReqToTokenPool` 承担了类似的逻辑位置到物理 slot 关系，而 `KVIndexTranslator`/backend 负责把它整理成 kernel 能消费的读表；不要把这张 page-level 图当成 `UnifiedRadixCache` 的内部结构。
 
-1. req_pool_idx=6 和 out_cache_loc[0]=38 分别在哪个 tensor/列表里？谁会释放它们？
-2. B 命中 A 的 37-token prefix 时，为什么没有 37-token K/V copy？
-3. prefix_indices、req_to_token[6,:]、树节点 FULL.value 为什么可能内容相同却不能互换 owner？
-4. 长度 37 的重复 prompt 为什么最多命中 36？把 page_size 改成 16 后又变成多少？
-5. kv_allocated_len=38、kv_committed_len=37 时，release_kv_cache 应释放哪一段？
-6. allocator 不够 slot 时，什么条件会触发 evict_for_alloc？为什么这不等于抢占 running request？
-7. FlashInfer/Triton 的读表不同，为什么仍能共享 ReqToTokenPool 和 allocator？
+## 8. 源码导航：主线入口索引
 
-如果这 7 个问题都能沿着上面的源码链接指出“字段 → 生产者 → 消费者 → owner → 回收点”，就已经完成了 SGLang plain Full Attention KV cache 的第一遍代码走读。
+这是主线必读的 10 个入口，不是所有相关文件的索引；第一遍按正文走，第二遍可从这里直接跳到源码：
+
+1. [`Scheduler.__init__`](../../python/sglang/srt/managers/scheduler.py#548-559) → [`init_model_worker`](../../python/sglang/srt/managers/scheduler.py#1047-1060) → [`init_memory_pools`](../../python/sglang/srt/managers/scheduler.py#1020-1033)；
+2. [`init_target_memory_pool`](../../python/sglang/srt/managers/scheduler.py#1006-1018) → [`TpModelWorker.alloc_memory_pool`](../../python/sglang/srt/managers/tp_worker.py#407-433)；
+3. [`ModelRunner.alloc_memory_pool`](../../python/sglang/srt/model_executor/model_runner.py#881-903) → [`KVCacheConfigurator.configure`](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#296-329)；
+4. [`MHATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#1809-1931) 与 [`ReqToTokenPool`](../../python/sglang/srt/mem_cache/memory_pool.py#257-337)；
+5. [`TokenToKVPoolAllocator.alloc`](../../python/sglang/srt/mem_cache/allocator/token.py#28-75)；
+6. [`Req.init_next_round_input`](../../python/sglang/srt/managers/schedule_batch.py#1390-1490) → [`UnifiedRadixCache.match_prefix`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#523-539)；
+7. [`ScheduleBatch.prepare_for_extend`](../../python/sglang/srt/managers/schedule_batch.py#2504-2552) → [`alloc_for_extend`](../../python/sglang/srt/mem_cache/allocation.py#282-389)；
+8. [`ForwardBatch`](../../python/sglang/srt/model_executor/forward_batch_info.py#393-411) → [`FlashInferBackend.forward_extend`](../../python/sglang/srt/layers/attention/flashinfer_backend.py#1314-1472)；
+9. [`release_kv_cache`](../../python/sglang/srt/mem_cache/common.py#254-297) → [`UnifiedRadixCache.cache_finished_req`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#838-924)；
+10. [`evict_from_tree_cache`](../../python/sglang/srt/mem_cache/common.py#168-195) → `evict_for_alloc()`。
+
+每读完一个入口，先回答：**它改了哪个字段？下一个函数从哪里拿这个字段？谁最终释放它？**
+
+## 9. 两遍读法：先建立模型，再定位 bug
+
+第一遍不要打开所有分支。按 `1 → 2 → 3 → 4 → 5.2～5.4 → 6.1` 读完，只需要确认四件事：谁拥有 row、谁发放 slot、谁写 K/V、谁在 finish/eviction 时继续保护或释放 slot。第 7 节和具体 kernel 先跳过。
+
+第二遍再按现象选择入口：
+
+| 你看到的现象 | 从哪里开始 debug | 先确认什么 |
+|---|---|---|
+| prefix 明明相同却没有命中 | [`Req.init_next_round_input`](../../python/sglang/srt/managers/schedule_batch.py#1390-1490) → [`UnifiedRadixCache.match_prefix`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#523-539) | `RadixKey`、`key_limit`、`prefix_indices` |
+| row 有了但 slot 映射不对 | [`prepare_for_extend`](../../python/sglang/srt/managers/schedule_batch.py#2504-2552) → [`alloc_for_extend`](../../python/sglang/srt/mem_cache/allocation.py#282-389) | `req_pool_indices`、`out_cache_loc`、`write_cache_indices()` |
+| 当前 token 的 K/V 写错位置 | [`FlashInferBackend.forward_extend`](../../python/sglang/srt/layers/attention/flashinfer_backend.py#1314-1472) | `cache_loc`、layer ID、`set_kv_buffer()` |
+| 历史上下文长度或读取范围不对 | [`KVIndexTranslator.index_table_for_batch`](../../python/sglang/srt/mem_cache/kv_index_translator.py#290-320) | `req_to_token`、`seq_lens`、kernel-facing table |
+| 请求结束后显存没有回收或 prefix 不再复用 | [`release_kv_cache`](../../python/sglang/srt/mem_cache/common.py#254-297) → [`cache_finished_req`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#838-924) | `kv_committed_len`、tree lock、allocator free list |
+
+这样 debug 是沿着字段反向走，而不是从一个巨大的 attention kernel 入口盲目向前翻。
+
+## 10. 不变量与自测
+
+1. `req_pool_idx`、逻辑位置 `p`、KV slot `loc`、page ID 分别属于哪一层？
+2. prefix hit 为什么只返回 slot-ID，不复制历史 K/V？
+3. `out_cache_loc` 为什么只包含本轮新 suffix？
+4. `ForwardBatch` 为什么只携带 `req_pool_indices`、`seq_lens` 和 `out_cache_loc`，而由 backend/translator 构造读表？
+5. finish、eviction、retract 分别由谁触发，哪一种会把 slot-ID 放入 tree？
+6. 为什么 `TpModelWorker.alloc_memory_pool()` 前面还要经过 `init_target_memory_pool()`？
+
+如果这 6 个问题都能沿着文中的入口找到 producer、consumer 和 lifetime，plain Full Attention KV cache 的第一遍源码走读就完成了。后续再单独展开 page allocator、chunked prefill 或具体 kernel，不会破坏这条主线。

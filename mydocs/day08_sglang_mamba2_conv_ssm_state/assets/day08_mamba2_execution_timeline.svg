@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="1020" viewBox="0 0 1680 1020">
+  <defs>
+    <style>
+      .title{font:700 30px Inter,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#17223b}
+      .section{font:700 20px Inter,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#263552}
+      .boxTitle{font:700 17px Inter,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#17223b}
+      .body{font:15px Inter,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#334155}
+      .small{font:13px Inter,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#475569}
+      .mono{font:14px "JetBrains Mono",Consolas,monospace;fill:#24324a}
+      .data{fill:none;stroke:#2563eb;stroke-width:2.5;marker-end:url(#ad)}
+      .meta{fill:none;stroke:#7c3aed;stroke-width:2.1;stroke-dasharray:9 7;marker-end:url(#am)}
+      .state{fill:none;stroke:#059669;stroke-width:2.6;marker-end:url(#as)}
+      .card{stroke-width:1.5}
+    </style>
+    <marker id="ad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2563eb"/></marker>
+    <marker id="am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#7c3aed"/></marker>
+    <marker id="as" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#059669"/></marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#64748b" flood-opacity="0.15"/></filter>
+  </defs>
+  <rect width="1680" height="1020" fill="#f8fafc"/>
+  <text x="55" y="55" class="title">Day08: conv + SSM state commit timeline for one Falcon-H1 request</text>
+
+  <rect x="45" y="86" rx="22" width="1590" height="535" fill="#eff6ff" stroke="#93c5fd" class="card"/>
+  <text x="72" y="123" class="section">Request A: physical slot 7 stays fixed while its payload changes</text>
+
+  <rect x="75" y="160" rx="16" width="345" height="175" fill="#fff" stroke="#93c5fd" class="card" filter="url(#shadow)"/>
+  <text x="98" y="194" class="boxTitle">Prefill forward</text>
+  <text x="98" y="224" class="mono">input=[101,42,77,9,5]</text>
+  <text x="98" y="250" class="mono">positions=[0..4]</text>
+  <text x="98" y="278" class="body">conv: C₀ → C₅ (commit final 3 entries)</text>
+  <text x="98" y="305" class="body">SSM: S₀ → S₅ (commit after scan)</text>
+
+  <rect x="485" y="160" rx="16" width="310" height="175" fill="#fff" stroke="#93c5fd" class="card" filter="url(#shadow)"/>
+  <text x="508" y="194" class="boxTitle">logits / sample</text>
+  <text x="508" y="224" class="mono">sampled token = 314</text>
+  <text x="508" y="258" class="body">314 is sampled, but has not yet</text>
+  <text x="508" y="283" class="body">entered the next layer forward,</text>
+  <text x="508" y="308" class="body">so it is not in C/S yet.</text>
+
+  <rect x="860" y="160" rx="16" width="305" height="175" fill="#fff" stroke="#93c5fd" class="card" filter="url(#shadow)"/>
+  <text x="883" y="194" class="boxTitle">Decode #1</text>
+  <text x="883" y="224" class="mono">input=[314], position=5</text>
+  <text x="883" y="253" class="body">conv update: C₅ → C₆</text>
+  <text x="883" y="280" class="body">state update: S₅ → S₆</text>
+  <text x="883" y="307" class="small">sample 271; it is not in state yet</text>
+
+  <rect x="1230" y="160" rx="16" width="330" height="175" fill="#fff" stroke="#93c5fd" class="card" filter="url(#shadow)"/>
+  <text x="1253" y="194" class="boxTitle">Decode #2</text>
+  <text x="1253" y="224" class="mono">input=[271], position=6</text>
+  <text x="1253" y="253" class="body">conv update: C₆ → C₇</text>
+  <text x="1253" y="280" class="body">state update: S₆ → S₇</text>
+  <text x="1253" y="307" class="small">Both steps mutate physical slot 7</text>
+
+  <path d="M420 245H485" class="data"/>
+  <path d="M795 245H860" class="data"/>
+  <path d="M1165 245H1230" class="data"/>
+
+  <rect x="75" y="380" rx="14" width="1485" height="185" fill="#ecfdf5" stroke="#34d399" class="card"/>
+  <text x="102" y="415" class="boxTitle">Actual order inside one Mamba-2 layer</text>
+  <rect x="105" y="447" rx="11" width="220" height="72" fill="#fff" stroke="#6ee7b7" class="card"/>
+  <text x="125" y="476" class="body">in_proj</text><text x="125" y="499" class="mono">gate | [x,B,C] | dt</text>
+  <rect x="380" y="447" rx="11" width="230" height="72" fill="#fff" stroke="#6ee7b7" class="card"/>
+  <text x="400" y="476" class="body">causal conv</text><text x="400" y="499" class="mono">read/write conv[slot]</text>
+  <rect x="665" y="447" rx="11" width="240" height="72" fill="#fff" stroke="#6ee7b7" class="card"/>
+  <text x="685" y="476" class="body">split post-conv</text><text x="685" y="499" class="mono">x′ | B′ | C′</text>
+  <rect x="960" y="447" rx="11" width="260" height="72" fill="#fff" stroke="#6ee7b7" class="card"/>
+  <text x="980" y="476" class="body">scan / recurrent update</text><text x="980" y="499" class="mono">read/write temporal[slot]</text>
+  <rect x="1275" y="447" rx="11" width="250" height="72" fill="#fff" stroke="#6ee7b7" class="card"/>
+  <text x="1295" y="476" class="body">gated norm + out_proj</text><text x="1295" y="499" class="mono">mamba_hidden_states</text>
+  <path d="M325 483H380" class="state"/><path d="M610 483H665" class="state"/><path d="M905 483H960" class="state"/><path d="M1220 483H1275" class="state"/>
+
+  <rect x="45" y="655" rx="22" width="1590" height="305" fill="#f5efff" stroke="#a78bfa" class="card"/>
+  <text x="72" y="692" class="section">Prefix checkpoint (extra_buffer): track first, insert later; never co-write active state</text>
+  <rect x="85" y="735" rx="14" width="345" height="155" fill="#fff" stroke="#c4b5fd" class="card" filter="url(#shadow)"/>
+  <text x="108" y="769" class="boxTitle">A reaches track boundary 256</text>
+  <text x="108" y="799" class="body">track slot 21 stores (C₂₅₆,S₂₅₆)</text>
+  <text x="108" y="827" class="body">stash/finish hands [21] to tree</text>
+  <text x="108" y="855" class="small">Tree then stores slot ID; payload stays in MambaPool</text>
+
+  <rect x="535" y="735" rx="14" width="300" height="155" fill="#fff" stroke="#c4b5fd" class="card" filter="url(#shadow)"/>
+  <text x="558" y="769" class="boxTitle">Request B hits prefix</text>
+  <text x="558" y="799" class="body">Allocate active slot 8 first</text>
+  <text x="558" y="827" class="body">deferred COW: 21 → 8</text>
+  <text x="558" y="855" class="small">Copy executes on the forward stream</text>
+
+  <rect x="940" y="735" rx="14" width="300" height="155" fill="#fff" stroke="#c4b5fd" class="card" filter="url(#shadow)"/>
+  <text x="963" y="769" class="boxTitle">Request C hits prefix</text>
+  <text x="963" y="799" class="body">Allocate active slot 9 first</text>
+  <text x="963" y="827" class="body">deferred COW: 21 → 9</text>
+  <text x="963" y="855" class="small">B/C mutate separate slots in place</text>
+
+  <rect x="1340" y="735" rx="14" width="250" height="155" fill="#fff" stroke="#c4b5fd" class="card" filter="url(#shadow)"/>
+  <text x="1363" y="769" class="boxTitle">evict / reuse</text>
+  <text x="1363" y="799" class="body">tree drops owner of [21]</text>
+  <text x="1363" y="827" class="body">allocator reclaims slot 21</text>
+  <text x="1363" y="855" class="small">Old bytes remain but have no meaning</text>
+
+  <path d="M430 812H535" class="meta"/><path d="M430 842V905H905V812H940" class="meta"/><path d="M1240 812H1340" class="meta"/>
+  <text x="75" y="935" class="small">Solid: activation/state payload flow. Dashed: slot/COW/owner relation. IDs are teaching values, not runtime logs.</text>
+</svg>

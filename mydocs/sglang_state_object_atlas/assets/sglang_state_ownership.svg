@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="960" viewBox="0 0 1500 960">
+  <defs>
+    <marker id="meta" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#77769c" stroke-width="1.6"/></marker>
+    <marker id="data" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#23966d"/></marker>
+    <style>
+      text{font-family:Arial,DejaVu Sans,sans-serif;fill:#26364c}
+      .title{font-size:29px;font-weight:700}.sub{font-size:18px;fill:#5c6c80}
+      .stage{font-size:17px;letter-spacing:1px;font-weight:700;fill:#59687d}
+      .name{font-size:23px;font-weight:700}.body{font-size:19px}.note{font-size:17px;fill:#626c80}
+      .m{fill:none;stroke:#77769c;stroke-width:2;stroke-dasharray:7 5;marker-end:url(#meta)}
+      .d{fill:none;stroke:#23966d;stroke-width:3;marker-end:url(#data)}
+    </style>
+  </defs>
+  <rect width="1500" height="960" fill="#f9fbfe"/>
+  <text x="42" y="48" class="title">SGLang Serving State — object ownership map</text>
+  <text x="42" y="78" class="sub">Self-drawn summary · static CUDA pools · arrows show relationships, NOT a complete execution timeline</text>
+  <rect x="30" y="103" width="1440" height="188" rx="18" fill="#edf4ff" stroke="#ccdcf0"/>
+  <text x="50" y="131" class="stage">REQUEST / ALLOCATOR / PREFIX-CACHE METADATA</text>
+  <rect x="50" y="148" width="370" height="120" rx="13" fill="white" stroke="#a6bfdc"/>
+  <text x="70" y="180" class="name">Req + ReqKvInfo</text>
+  <text x="70" y="212" class="body">row ID · lengths · prefix observation</text>
+  <text x="70" y="244" class="note">No K/V numerical payload here</text>
+  <rect x="445" y="148" width="555" height="120" rx="13" fill="white" stroke="#a6bfdc"/>
+  <text x="465" y="180" class="name">UnifiedRadixCache / TreeCore / FULL</text>
+  <text x="465" y="212" class="body">token key → loc vector · NodeId · lock_ref</text>
+  <text x="465" y="244" class="note">Cached locs remain occupied until eviction</text>
+  <rect x="1025" y="148" width="425" height="120" rx="13" fill="white" stroke="#a6bfdc"/>
+  <text x="1045" y="180" class="name">Token / page allocator</text>
+  <text x="1045" y="212" class="body">free IDs → allocated token locs</text>
+  <text x="1045" y="244" class="note">Allocates capacity, not token values</text>
+
+  <path d="M210 268 L210 356" class="m"/>
+  <text x="64" y="326" class="note">row selection</text>
+  <path d="M560 268 L560 356" class="m"/>
+  <text x="575" y="326" class="note">matched locs</text>
+  <path d="M1220 268 L1220 356" class="m"/>
+  <text x="1235" y="326" class="note">new write locs</text>
+
+  <rect x="30" y="356" width="635" height="184" rx="18" fill="#f1edff" stroke="#c9bdea"/>
+  <text x="50" y="387" class="stage">LOGICAL MAPPING — GPU INTEGER TABLE</text>
+  <text x="50" y="426" class="name">ReqToTokenPool.req_to_token</text>
+  <text x="50" y="462" class="body">[request row, sequence position] → loc</text>
+  <text x="50" y="499" class="body">Two rows may point to the SAME prefix locs.</text>
+
+  <rect x="900" y="356" width="570" height="184" rx="18" fill="#f1edff" stroke="#c9bdea"/>
+  <text x="920" y="387" class="stage">PER-FORWARD INPUTS / ADDRESS VIEW</text>
+  <text x="920" y="425" class="name">ScheduleBatch → ForwardBatch</text>
+  <text x="920" y="459" class="body">req_pool_indices · seq_lens · out_cache_loc</text>
+  <text x="920" y="492" class="body">KVIndexTranslator → backend metadata</text>
+  <text x="920" y="521" class="note">Metadata is prepared before model attention runs.</text>
+  <path d="M665 428 L896 428" class="m"/>
+  <text x="690" y="404" class="note">gather / translate</text>
+  <text x="690" y="458" class="note">table + lengths</text>
+
+  <path d="M300 540 L300 654" class="m"/>
+  <text x="320" y="603" class="note">loc selects storage; this arrow moves NO K/V</text>
+  <path d="M1435 540 L1435 654" class="m"/>
+  <text x="1000" y="592" class="note">indices · lengths · layout · pointer views</text>
+  <text x="1000" y="620" class="note">model layer → RadixAttention → backend</text>
+
+  <rect x="30" y="656" width="675" height="196" rx="18" fill="#e8f7ee" stroke="#a5d6bc"/>
+  <text x="50" y="688" class="stage">PHYSICAL GPU STATE — PERSISTENT TENSORS</text>
+  <text x="50" y="726" class="name">MHATokenToKVPool / MLA / DSA</text>
+  <text x="50" y="763" class="body">MHA: per-layer K and V numerical arrays</text>
+  <text x="50" y="799" class="body">MLA: latent + RoPE; DSA: extra IndexKeyCache</text>
+  <text x="50" y="830" class="note">Finish / eviction normally returns IDs, not these buffers.</text>
+  <rect x="925" y="656" width="545" height="196" rx="18" fill="#e8f7ee" stroke="#a5d6bc"/>
+  <text x="945" y="688" class="stage">BACKEND / KERNEL-VISIBLE VIEW</text>
+  <text x="945" y="726" class="name">Current Q, K/V + physical pool views</text>
+  <text x="945" y="763" class="body">Write this step's new state to output locs.</text>
+  <text x="945" y="799" class="body">Read allowed history via read metadata.</text>
+  <text x="945" y="830" class="note">No prefix-tree traversal inside the attention call.</text>
+  <path d="M925 743 L710 743" class="d"/>
+  <text x="733" y="725" class="note">write K/V</text>
+  <path d="M705 804 L920 804" class="d"/>
+  <text x="739" y="784" class="note">read state</text>
+
+  <path d="M48 896 L118 896" class="m"/>
+  <text x="132" y="902" class="body">metadata / index / address relation</text>
+  <path d="M575 896 L645 896" class="d"/>
+  <text x="659" y="902" class="body">actual K/V or latent-data movement</text>
+  <text x="48" y="939" class="note">Prefix matching may copy INDEX tensors; it does not copy the already-cached K/V payload.</text>
+</svg>

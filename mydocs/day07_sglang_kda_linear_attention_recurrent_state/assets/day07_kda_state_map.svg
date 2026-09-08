@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="920" viewBox="0 0 1600 920">
+  <defs>
+    <style>
+      .title { font: 700 28px 'DejaVu Sans', sans-serif; fill: #172033; }
+      .section { font: 700 20px 'DejaVu Sans', sans-serif; fill: #24324a; }
+      .boxTitle { font: 700 17px 'DejaVu Sans', sans-serif; fill: #18243a; }
+      .body { font: 14px 'DejaVu Sans Mono', monospace; fill: #29364d; }
+      .small { font: 13px 'DejaVu Sans', sans-serif; fill: #4b5870; }
+      .blue { fill: #eaf4ff; stroke: #69a6e8; stroke-width: 2; }
+      .purple { fill: #f3edff; stroke: #9b7be0; stroke-width: 2; }
+      .green { fill: #eaf9f1; stroke: #61b98a; stroke-width: 2; }
+      .amber { fill: #fff7e5; stroke: #dba84b; stroke-width: 2; }
+      .neutral { fill: #f7f9fc; stroke: #9ba8bb; stroke-width: 2; }
+      .solid { fill: none; stroke: #2c6fbb; stroke-width: 3; marker-end: url(#arrowBlue); }
+      .dash { fill: none; stroke: #7c54c6; stroke-width: 2.5; stroke-dasharray: 9 7; marker-end: url(#arrowPurple); }
+      .owner { fill: none; stroke: #2d9463; stroke-width: 2.5; stroke-dasharray: 3 7; marker-end: url(#arrowGreen); }
+    </style>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#2c6fbb"/></marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7c54c6"/></marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#2d9463"/></marker>
+  </defs>
+  <rect width="1600" height="920" fill="#ffffff"/>
+  <text x="50" y="48" class="title">Day07 — One request, two independent persistent-state address spaces</text>
+
+  <rect x="40" y="78" rx="18" ry="18" width="1520" height="180" class="neutral"/>
+  <text x="65" y="112" class="section">1. Request and per-forward metadata</text>
+  <rect x="80" y="138" rx="12" width="235" height="88" class="blue"/>
+  <text x="100" y="166" class="boxTitle">Req A / row r=7</text>
+  <text x="100" y="192" class="body">tokens = [101,42,17,9]</text>
+  <text x="100" y="214" class="body">request-level owner</text>
+  <rect x="390" y="132" rx="12" width="475" height="104" class="purple"/>
+  <text x="410" y="160" class="boxTitle">ForwardBatch (ephemeral)</text>
+  <text x="410" y="187" class="body">req_pool_indices=[7]   query_start_loc=[0,4]</text>
+  <text x="410" y="211" class="body">out_cache_loc=[21,22,23,24]   state_slot=[5]</text>
+  <rect x="950" y="138" rx="12" width="530" height="88" class="green"/>
+  <text x="970" y="166" class="boxTitle">HybridReqToTokenPool</text>
+  <text x="970" y="192" class="body">req_to_token[7,*]    req_row_to_mamba_slot[7]=5</text>
+  <text x="970" y="214" class="body">maps only; no attention payload</text>
+  <path d="M315 181 L390 181" class="dash"/>
+  <path d="M865 181 L950 181" class="dash"/>
+
+  <rect x="40" y="282" rx="18" ry="18" width="740" height="470" class="blue"/>
+  <text x="65" y="318" class="section">2A. Full-attention side (Kimi Linear uses MLA here)</text>
+  <rect x="80" y="350" rx="12" width="250" height="105" class="neutral"/>
+  <text x="100" y="380" class="boxTitle">MLA layer projection</text>
+  <text x="100" y="408" class="body">current token activations</text>
+  <text x="100" y="432" class="body">latent / RoPE side data</text>
+  <rect x="445" y="350" rx="12" width="285" height="105" class="blue"/>
+  <text x="465" y="380" class="boxTitle">Token-indexed cache pool</text>
+  <text x="465" y="408" class="body">physical loc 21,22,23,24</text>
+  <text x="465" y="432" class="body">grows with sequence length T</text>
+  <path d="M330 402 L445 402" class="solid"/>
+  <rect x="80" y="520" rx="12" width="650" height="175" class="green"/>
+  <text x="100" y="550" class="boxTitle">Addressing and ownership</text>
+  <text x="100" y="580" class="body">logical position t  --map--> req_to_token[7,t] = token loc</text>
+  <text x="100" y="610" class="body">Radix FULL component may keep immutable prefix token locs</text>
+  <text x="100" y="640" class="body">decode appends a new loc; past payload rows stay unchanged</text>
+  <text x="100" y="670" class="body">share unit: token/page-backed prefix</text>
+
+  <rect x="820" y="282" rx="18" ry="18" width="740" height="470" class="purple"/>
+  <text x="845" y="318" class="section">2B. KDA side (fixed slot, mutable recurrent state)</text>
+  <rect x="860" y="350" rx="12" width="265" height="105" class="neutral"/>
+  <text x="880" y="380" class="boxTitle">KDA projections</text>
+  <text x="880" y="408" class="body">mixed_qkv + raw gate a</text>
+  <text x="880" y="432" class="body">beta + output norm gate</text>
+  <rect x="1215" y="340" rx="12" width="300" height="125" class="purple"/>
+  <text x="1235" y="370" class="boxTitle">MambaPool slot m=5</text>
+  <text x="1235" y="398" class="body">conv[l,5,Kconv-1,Q+K+V]</text>
+  <text x="1235" y="422" class="body">temporal[l,5,H,V,K]</text>
+  <text x="1235" y="446" class="body">fixed size; values mutate in place</text>
+  <path d="M1125 403 L1215 403" class="solid"/>
+  <rect x="860" y="520" rx="12" width="655" height="175" class="green"/>
+  <text x="880" y="550" class="boxTitle">Addressing and ownership</text>
+  <text x="880" y="580" class="body">request row 7 --map--> slot 5; layer id --map--> pool layer</text>
+  <text x="880" y="610" class="body">prefill scan and each decode update the same slot in place</text>
+  <text x="880" y="640" class="body">Radix MAMBA component keeps an immutable checkpoint slot</text>
+  <text x="880" y="670" class="body">forked request restores by COW into a different writable slot</text>
+
+  <path d="M430 236 L55 265 L55 605 L80 605" class="dash"/>
+  <path d="M825 236 L1540 265 L1540 605 L1515 605" class="dash"/>
+  <path d="M1450 226 L1530 255 L1530 402 L1515 402" class="owner"/>
+
+  <rect x="40" y="780" rx="16" width="1520" height="105" class="amber"/>
+  <text x="65" y="812" class="section">3. Coordination, not one merged cache</text>
+  <text x="65" y="842" class="body">same Req + same ForwardBatch + layer-aware HybridLinearAttnBackend</text>
+  <text x="65" y="867" class="body">different allocators, indices, payloads, mutation rules, and prefix-share units</text>
+  <line x1="930" y1="820" x2="1010" y2="820" class="solid"/><text x="1025" y="825" class="small">payload flow</text>
+  <line x1="1150" y1="820" x2="1230" y2="820" class="dash"/><text x="1245" y="825" class="small">metadata/address relation</text>
+  <line x1="1150" y1="858" x2="1230" y2="858" class="owner"/><text x="1245" y="863" class="small">ownership relation</text>
+</svg>
