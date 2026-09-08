@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980" viewBox="0 0 1600 980">
+  <defs>
+    <style>
+      .title{font:700 30px Inter,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#17223b}
+      .section{font:700 20px Inter,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#263552}
+      .boxTitle{font:700 18px Inter,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#17223b}
+      .body{font:15px Inter,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#334155}
+      .small{font:14px Inter,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#475569}
+      .mono{font:14px "JetBrains Mono",Consolas,monospace;fill:#24324a}
+      .card{stroke-width:1.6}
+      .meta{fill:none;stroke:#7c3aed;stroke-width:2.2;stroke-dasharray:9 7;marker-end:url(#arrowMeta)}
+      .data{fill:none;stroke:#2563eb;stroke-width:2.6;marker-end:url(#arrowData)}
+      .state{fill:none;stroke:#059669;stroke-width:2.6;marker-end:url(#arrowState)}
+    </style>
+    <marker id="arrowData" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#2563eb"/></marker>
+    <marker id="arrowMeta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#7c3aed"/></marker>
+    <marker id="arrowState" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#059669"/></marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#64748b" flood-opacity="0.16"/></filter>
+  </defs>
+
+  <rect width="1600" height="980" fill="#f8fafc"/>
+  <text x="60" y="56" class="title">Day08: Falcon-H1 state map — Full Attention vs Mamba-2</text>
+
+  <rect x="55" y="88" rx="22" width="1490" height="185" fill="#eaf3ff" stroke="#93c5fd" class="card"/>
+  <text x="82" y="124" class="section">1. Request and per-forward control plane</text>
+  <rect x="90" y="145" rx="14" width="270" height="94" fill="#fff" stroke="#93c5fd" class="card" filter="url(#shadow)"/>
+  <text x="112" y="177" class="boxTitle">Req A</text>
+  <text x="112" y="204" class="mono">req_pool_idx = 17</text>
+  <text x="112" y="227" class="mono">seq_len = 5 → 6 → 7</text>
+  <rect x="465" y="145" rx="14" width="355" height="94" fill="#fff" stroke="#93c5fd" class="card" filter="url(#shadow)"/>
+  <text x="487" y="177" class="boxTitle">ForwardBatch</text>
+  <text x="487" y="204" class="mono">req_pool_indices=[17]</text>
+  <text x="487" y="227" class="mono">input_ids / positions / lengths</text>
+  <rect x="930" y="145" rx="14" width="530" height="94" fill="#fff" stroke="#93c5fd" class="card" filter="url(#shadow)"/>
+  <text x="952" y="177" class="boxTitle">HybridLinearAttnBackend</text>
+  <text x="952" y="204" class="body">Builds separate full-attention and Mamba-2 metadata</text>
+  <text x="952" y="227" class="small">Shared batch facts; disjoint payload address spaces</text>
+  <path d="M360 192H465" class="meta"/>
+  <path d="M820 192H930" class="meta"/>
+
+  <rect x="55" y="305" rx="22" width="720" height="510" fill="#edf6ff" stroke="#60a5fa" class="card"/>
+  <text x="82" y="342" class="section">2. Full Attention path: token-wise KV</text>
+  <rect x="92" y="375" rx="14" width="300" height="105" fill="#fff" stroke="#93c5fd" class="card" filter="url(#shadow)"/>
+  <text x="114" y="407" class="boxTitle">ReqToTokenPool</text>
+  <text x="114" y="435" class="mono">req_to_token[17, pos]</text>
+  <text x="114" y="458" class="mono">→ loc 320..326</text>
+  <rect x="470" y="375" rx="14" width="260" height="105" fill="#fff" stroke="#93c5fd" class="card" filter="url(#shadow)"/>
+  <text x="492" y="407" class="boxTitle">token/page allocator</text>
+  <text x="492" y="435" class="body">Allocate by token/page</text>
+  <text x="492" y="458" class="body">Decode appends a new loc</text>
+  <path d="M392 428H470" class="meta"/>
+
+  <rect x="92" y="540" rx="16" width="638" height="200" fill="#dbeafe" stroke="#3b82f6" class="card" filter="url(#shadow)"/>
+  <text x="118" y="575" class="boxTitle">MHATokenToKVPool (per layer)</text>
+  <text x="118" y="608" class="mono">K[layer][loc, kv_head, head_dim]</text>
+  <text x="118" y="636" class="mono">V[layer][loc, kv_head, head_dim]</text>
+  <text x="118" y="674" class="body">One row per token; old rows read-only, new token writes new loc</text>
+  <text x="118" y="704" class="body">Prefixes can share locs; storage grows with sequence length</text>
+  <path d="M242 480V540" class="data"/>
+  <path d="M600 480V520H420V540" class="meta"/>
+
+  <rect x="825" y="305" rx="22" width="720" height="510" fill="#f5efff" stroke="#a78bfa" class="card"/>
+  <text x="852" y="342" class="section">3. Mamba-2 path: request-level mutable state</text>
+  <rect x="862" y="375" rx="14" width="310" height="105" fill="#fff" stroke="#c4b5fd" class="card" filter="url(#shadow)"/>
+  <text x="884" y="407" class="boxTitle">request row → state slot</text>
+  <text x="884" y="435" class="mono">mapping[17] = slot 7</text>
+  <text x="884" y="458" class="small">Decode keeps address; mutates payload in place</text>
+  <rect x="1240" y="375" rx="14" width="260" height="105" fill="#fff" stroke="#c4b5fd" class="card" filter="url(#shadow)"/>
+  <text x="1262" y="407" class="boxTitle">MambaSlotAllocator</text>
+  <text x="1262" y="435" class="body">One slot spans all layers</text>
+  <text x="1262" y="458" class="body">Owns IDs, not state bytes</text>
+  <path d="M1172 428H1240" class="meta"/>
+
+  <rect x="862" y="530" rx="16" width="638" height="230" fill="#ede9fe" stroke="#8b5cf6" class="card" filter="url(#shadow)"/>
+  <text x="888" y="565" class="boxTitle">MambaPool (preallocated at startup)</text>
+  <rect x="890" y="590" rx="12" width="270" height="130" fill="#ecfdf5" stroke="#34d399" class="card"/>
+  <text x="910" y="621" class="boxTitle">conv state</text>
+  <text x="910" y="649" class="mono">[L, slot, 1536, 3]</text>
+  <text x="910" y="675" class="body">Latest 3 raw [x|B|C] vectors</text>
+  <text x="910" y="701" class="small">BF16; short sliding window</text>
+  <rect x="1190" y="590" rx="12" width="280" height="130" fill="#ecfdf5" stroke="#34d399" class="card"/>
+  <text x="1210" y="621" class="boxTitle">temporal / SSM state</text>
+  <text x="1210" y="649" class="mono">[L, slot, 128, 8, 256]</text>
+  <text x="1210" y="675" class="body">Long-range recurrent summary</text>
+  <text x="1210" y="701" class="small">FP32; not a token list</text>
+  <path d="M1017 480V530" class="state"/>
+  <path d="M1370 480V510H1180V530" class="meta"/>
+
+  <rect x="195" y="850" rx="18" width="1210" height="80" fill="#ecfdf5" stroke="#34d399" class="card"/>
+  <text x="225" y="882" class="boxTitle">The actual fusion boundary</text>
+  <text x="225" y="910" class="body">Add attention_hidden_states and mamba_hidden_states; allocator, mapping, and physical storage remain separate.</text>
+  <path d="M410 740V850" class="data"/>
+  <path d="M1180 760V850" class="state"/>
+
+  <rect x="1230" y="16" rx="10" width="315" height="64" fill="#ffffff" stroke="#cbd5e1"/>
+  <line x1="1248" y1="36" x2="1290" y2="36" class="data"/>
+  <text x="1302" y="41" class="small">payload / activation</text>
+  <line x1="1248" y1="62" x2="1290" y2="62" class="meta"/>
+  <text x="1302" y="67" class="small">metadata / address</text>
+</svg>

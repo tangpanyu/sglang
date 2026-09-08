@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="760" viewBox="0 0 1600 760">
+  <defs>
+    <style>
+      .title { font: 700 28px 'DejaVu Sans', sans-serif; fill: #172033; }
+      .stage { font: 700 18px 'DejaVu Sans', sans-serif; fill: #1d2a42; }
+      .body { font: 14px 'DejaVu Sans Mono', monospace; fill: #29364d; }
+      .small { font: 13px 'DejaVu Sans', sans-serif; fill: #516078; }
+      .blue { fill: #eaf4ff; stroke: #69a6e8; stroke-width: 2; }
+      .purple { fill: #f3edff; stroke: #9b7be0; stroke-width: 2; }
+      .green { fill: #eaf9f1; stroke: #61b98a; stroke-width: 2; }
+      .amber { fill: #fff7e5; stroke: #dba84b; stroke-width: 2; }
+      .solid { fill: none; stroke: #2c6fbb; stroke-width: 3; marker-end: url(#arrowBlue); }
+      .dash { fill: none; stroke: #7c54c6; stroke-width: 2.5; stroke-dasharray: 9 7; marker-end: url(#arrowPurple); }
+    </style>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#2c6fbb"/></marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7c54c6"/></marker>
+  </defs>
+  <rect width="1600" height="760" fill="#ffffff"/>
+  <text x="45" y="47" class="title">KDA state timeline — prompt, two decode steps, cache, restore</text>
+
+  <rect x="45" y="90" rx="14" width="255" height="165" class="blue"/>
+  <text x="65" y="122" class="stage">A. Allocate / restore</text>
+  <text x="65" y="154" class="body">req row r=7</text>
+  <text x="65" y="179" class="body">state slot m=5</text>
+  <text x="65" y="204" class="body">clear(m=5) OR</text>
+  <text x="65" y="229" class="body">COW(cache_slot -> 5)</text>
+
+  <rect x="355" y="90" rx="14" width="300" height="165" class="purple"/>
+  <text x="375" y="122" class="stage">B. Prefill [101,42,17,9]</text>
+  <text x="375" y="154" class="body">query_start_loc=[0,4]</text>
+  <text x="375" y="179" class="body">conv: keep final Kconv-1 rows</text>
+  <text x="375" y="204" class="body">temporal: scan S0 -> S4</text>
+  <text x="375" y="229" class="body">output: o1..o4</text>
+
+  <rect x="710" y="90" rx="14" width="250" height="165" class="purple"/>
+  <text x="730" y="122" class="stage">C. Decode token y4</text>
+  <text x="730" y="154" class="body">same slot m=5</text>
+  <text x="730" y="179" class="body">conv shift + append</text>
+  <text x="730" y="204" class="body">S4 -> S5 in place</text>
+  <text x="730" y="229" class="body">returns layer output o5</text>
+
+  <rect x="1015" y="90" rx="14" width="250" height="165" class="purple"/>
+  <text x="1035" y="122" class="stage">D. Decode token y5</text>
+  <text x="1035" y="154" class="body">same address m=5</text>
+  <text x="1035" y="179" class="body">state value changes</text>
+  <text x="1035" y="204" class="body">S5 -> S6 in place</text>
+  <text x="1035" y="229" class="body">then logits sample y6</text>
+
+  <rect x="1320" y="90" rx="14" width="235" height="165" class="green"/>
+  <text x="1340" y="122" class="stage">E. Finish / cache</text>
+  <text x="1340" y="154" class="body">checkpoint at depth 6</text>
+  <text x="1340" y="179" class="body">tree owns immutable slot</text>
+  <text x="1340" y="204" class="body">req row released</text>
+  <text x="1340" y="229" class="body">eviction -> free list</text>
+
+  <path d="M300 172 L355 172" class="solid"/><path d="M655 172 L710 172" class="solid"/><path d="M960 172 L1015 172" class="solid"/><path d="M1265 172 L1320 172" class="solid"/>
+
+  <rect x="45" y="315" rx="16" width="1510" height="155" class="blue"/>
+  <text x="65" y="350" class="stage">What mutates during the KDA layer call</text>
+  <rect x="80" y="375" rx="10" width="260" height="65" class="amber"/>
+  <text x="100" y="402" class="body">hidden[T,D]</text><text x="100" y="425" class="small">temporary activation</text>
+  <rect x="415" y="375" rx="10" width="290" height="65" class="amber"/>
+  <text x="435" y="402" class="body">mixed_qkv, a, beta, gate</text><text x="435" y="425" class="small">temporary activation</text>
+  <rect x="780" y="375" rx="10" width="285" height="65" class="purple"/>
+  <text x="800" y="402" class="body">conv_state[slot] := tail</text><text x="800" y="425" class="small">persistent, in-place</text>
+  <rect x="1140" y="375" rx="10" width="350" height="65" class="purple"/>
+  <text x="1160" y="402" class="body">temporal[slot] := KDA recurrence</text><text x="1160" y="425" class="small">persistent, in-place; output computed here</text>
+  <path d="M340 408 L415 408" class="solid"/><path d="M705 408 L780 408" class="solid"/><path d="M1065 408 L1140 408" class="solid"/>
+
+  <rect x="45" y="520" rx="16" width="1510" height="190" class="green"/>
+  <text x="65" y="555" class="stage">Prefix fork: why COW is mandatory</text>
+  <rect x="90" y="585" rx="10" width="325" height="80" class="green"/>
+  <text x="110" y="614" class="body">Radix node: cached slot c=12</text>
+  <text x="110" y="639" class="body">immutable checkpoint S_prefix</text>
+  <rect x="635" y="575" rx="10" width="325" height="100" class="purple"/>
+  <text x="655" y="606" class="body">Req B: alloc writable slot 8</text>
+  <text x="655" y="631" class="body">copy state 12 -> 8</text>
+  <text x="655" y="656" class="body">decode mutates only slot 8</text>
+  <rect x="1180" y="575" rx="10" width="325" height="100" class="purple"/>
+  <text x="1200" y="606" class="body">Req C: alloc writable slot 9</text>
+  <text x="1200" y="631" class="body">copy state 12 -> 9</text>
+  <text x="1200" y="656" class="body">decode mutates only slot 9</text>
+  <path d="M415 615 C500 570,550 575,635 615" class="dash"/>
+  <path d="M415 635 C720 720,1000 710,1180 635" class="dash"/>
+  <rect x="485" y="678" rx="8" width="625" height="28" fill="#eaf9f1"/>
+  <text x="500" y="698" class="small">dashed: metadata-directed state copy; no shared writable recurrent state</text>
+</svg>
