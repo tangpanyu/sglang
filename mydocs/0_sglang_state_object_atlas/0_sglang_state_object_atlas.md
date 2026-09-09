@@ -1,10 +1,83 @@
-# 00｜SGLang Serving State 对象地图：先找入口，再查职责
+# 0｜SGLang Serving State 对象地图：先找入口，再查职责
 
-> 这篇是“源码导航页”，不是第三篇完整教程。它只回答三个问题：对象在哪里创建、保存什么、下一步交给谁。
-> 先读第 1 节的两条主线，再按问题跳到对象卡；不要从头背完所有类名。
+> 这篇是“源码导航页”，不是一篇完整机制教程。它只回答三个问题：对象在哪里创建、保存什么、下一步交给谁。
+> 第一次接触 SGLang 先读下面的“总览”，再读第 1 节的两条主线；不要从头背完所有类名。
 > 完整调用树只放在两条主线上；对象卡统一给“入口 → 输出”，可选分支只标出新增对象和入口。
 
-相关的完整推导放在 [Day05：Full Attention KV Cache](../sglang_full_attention_kv_cache/day05_sglang_full_attention_kv_cache.md) 和 [Day06：MLA/DSA latent cache](../day06_sglang_mla_dsa_latent_cache/day06_sglang_mla_dsa_latent_cache.md)。
+相关的完整推导放在 [第1篇：Full Attention KV Cache](../1_sglang_full_attention_kv_cache/1_sglang_full_attention_kv_cache.md) 和 [第2篇：MLA/DSA latent cache](../2_sglang_mla_dsa_latent_cache/2_sglang_mla_dsa_latent_cache.md)。
+
+## 总览：先从一次生成请求认识 SGLang
+
+如果这是第一次看 SGLang，先只读这一节；下面原有的 `## 0` 才是 Serving State 的深入地图。第一遍暂时不要碰 DSA、KDA、MoE、CUDA Graph 或并行通信，先回答一个简单问题：`engine.generate()` 怎样从 prompt 走到 `output["text"]`？
+
+把 SGLang 先看成一个“接收请求、组织 batch、执行模型、返回文本”的推理运行时：
+
+```mermaid
+flowchart LR
+    A["Python / HTTP 请求"] --> B["sgl.Engine 或服务入口"]
+    B --> C["TokenizerManager<br/>规范化与分词"]
+    C --> D["Scheduler<br/>准入与组 batch"]
+    D --> E["ScheduleBatch → ForwardBatch"]
+    E --> F["TpModelWorker / ModelRunner<br/>执行 model forward"]
+    F --> G["logits → 采样 token"]
+    G --> H["DetokenizerManager<br/>token → text"]
+    H --> I["output['text']"]
+```
+
+这张图是本项目当前普通文本生成路径的概念图，不是所有平台和 backend 的完整调用树。真实代码中，`Engine`、`TokenizerManager` 通常在调用进程，scheduler 和 detokenizer 由独立进程承载；它们通过内部通信交接请求和结果。
+
+### 最小外部契约
+
+先用一个普通模型跑通离线 Engine，不需要自定义模型或特殊 cache 参数：
+
+```python
+# 教学最小例子：可运行，但省略异常处理
+import sglang as sgl
+
+prompts = ["用一句话介绍 SGLang。", "推理引擎解决什么问题？"]
+sampling_params = {"temperature": 0.2, "top_p": 0.95, "max_new_tokens": 32}
+
+with sgl.Engine(model_path="Qwen/Qwen2.5-0.5B-Instruct") as engine:
+    outputs = engine.generate(prompts, sampling_params)
+
+for output in outputs:
+    print(output["text"])
+```
+
+这个例子对应仓库中的 [offline batch inference 示例](../../examples/runtime/engine/offline_batch_inference.py)；`Engine` 的公共导出在 [`sglang/__init__.py`](../../python/sglang/__init__.py#L66-L68)。`prompts` 可以是一个字符串，也可以是一组字符串；列表只表示请求输入是 batch，不表示 GPU 必须按列表边界执行。
+
+### 一条源码导航卡
+
+| 这一跳 | 真实入口 | 上一跳交给它什么 | 它交给下一跳什么 |
+|---|---|---|---|
+| 创建运行时 | [`Engine.__init__`](../../python/sglang/srt/entrypoints/engine.py#L244-L306) | `model_path` 等 `ServerArgs` 参数 | `TokenizerManager`、scheduler、detokenizer |
+| 建立请求 | [`Engine.generate`](../../python/sglang/srt/entrypoints/engine.py#L372-L480) | `prompt`、`sampling_params` | `GenerateReqInput` |
+| 规范化与分词 | [`TokenizerManager.generate_request`](../../python/sglang/srt/managers/tokenizer_manager.py#L770-L826) | `GenerateReqInput` | tokenized request、请求状态 |
+| 调度与执行 | [`Scheduler.run_batch`](../../python/sglang/srt/managers/scheduler.py#L4020-L4200) | 已准入的请求 | `ScheduleBatch`、worker 调用 |
+| 模型 forward | [`TpModelWorker.forward_batch_generation`](../../python/sglang/srt/managers/tp_worker.py#L593-L639) → [`ModelRunner.forward`](../../python/sglang/srt/model_executor/model_runner.py#L1582-L1645) | 当前 batch | logits 和执行侧副作用 |
+| 返回文本 | [`TokenizerManager._handle_batch_output`](../../python/sglang/srt/managers/tokenizer_manager.py#L2187-L2360) | detokenizer 的 token/text 片段 | `output["text"]` |
+
+读完这张表，先不要继续追 kernel。下一层的 `Req`、`ReqToTokenPool`、allocator、physical pool 和 radix tree，正是本页后半部分要解释的 Serving State：它们回答“请求运行时的地址和持久数据由谁拥有”，而不是重新定义一次生成 API。
+
+### 教学等价状态循环
+
+下面把多个异步组件压成一个不可直接运行的短循环，只为了建立“旧状态 + 当前输入 → 输出 + 新状态”的感觉：
+
+```python
+# 教学等价伪代码：不是 SGLang 原码
+state = {"input_ids": tokenize(prompt), "output_ids": [], "finished": False}
+while not state["finished"]:
+    batch = scheduler.pick_runnable(state)
+    logits = model_runner.forward(batch)
+    token_id = sample(logits, sampling_params)
+    state["output_ids"].append(token_id)
+    state["finished"] = should_stop(token_id)
+return {"text": detokenize(state["output_ids"])}
+```
+
+真实项目中，tokenizer 侧的请求累计状态由 `ReqState` 持有，调度侧还有 `Req`/`ScheduleBatch`，GPU 持久 K/V 则由 physical pool 持有；上面的 `state` 只是把 producer → owner/carrier → consumer 压缩成一条线。接下来进入 `## 0` 时，优先问“这个字段的 owner、定位 ID、写入点和消费者是谁”。
+
+如果只想完成整体入门，可以在这里停下；如果要查 cache 地址，再继续读下面两条真实代码导航。
 
 ## 0. 阅读边界
 
@@ -21,7 +94,7 @@
 
 先忽略权重加载、TP/NCCL、CUDA Graph、采样和 disaggregation。只有当它们改变你正在追的对象或地址时，再回来看对应分支。
 
-如果当前只在补 Day05：按 `0 → 1.1 → 1.2 → 2.1–2.5 → 3` 顺读即可；第 5、6、7、8、9 节都是按需查询。
+如果当前只在补第1篇：按 `0 → 1.1 → 1.2 → 2.1–2.5 → 3` 顺读即可；第 5、6、7、8、9 节都是按需查询。
 
 ## 1. 两条真实代码导航
 
@@ -240,7 +313,7 @@ A 的 row 恰好等于 page 3 只是示例巧合。row、page ID、flat loc 和 
 | 名称 | 例子 | owner | 能否直接当普通 KV 地址 |
 | --- | --- | --- | --- |
 | `rid` | `A` | `Req` | 否 |
-| token ID | `20` | 输入/输出 token 序列 | 否 |
+| token ID | `21` | 输入/输出 token 序列 | 否 |
 | sequence position | `5` | 请求内位置 | 否 |
 | request row | `3` | `ReqToTokenPool` | 否，需查表 |
 | flat token loc | `29` | token allocator / pool | 普通 flat pool 可以 |
@@ -263,7 +336,7 @@ A 的 row 恰好等于 page 3 只是示例巧合。row、page ID、flat loc 和 
 
 ### 5.1 MLA
 
-普通 MLA 不再把每层 K/V 展开成所有 head，而是由 [MLATokenToKVPool](../../python/sglang/srt/mem_cache/memory_pool.py#L3970-L4078) 保存 compressed latent 和 RoPE 分量，常见行形状近似 `[T + P, 1, r + s]`。这里 `T` 是 pool capacity，`P` 是 page size，`r`、`s` 来自模型配置。先沿用“同一个 loc 找到本层持久数值”的心智模型；payload shape 和 getter 再去读 Day06。
+普通 MLA 不再把每层 K/V 展开成所有 head，而是由 [MLATokenToKVPool](../../python/sglang/srt/mem_cache/memory_pool.py#L3970-L4078) 保存 compressed latent 和 RoPE 分量，常见行形状近似 `[T + P, 1, r + s]`。这里 `T` 是 pool capacity，`P` 是 page size，`r`、`s` 来自模型配置。先沿用“同一个 loc 找到本层持久数值”的心智模型；payload shape 和 getter 再去读第2篇。
 
 ### 5.2 DSA
 
@@ -328,7 +401,7 @@ mini 的 `Engine` 不是正式 SGLang 的 `TpModelWorker` 别名；它更像把�
 4. 为什么两个请求的 `req_pool_indices` 长度可以是 2，而 `out_cache_loc` 长度是 3 或 8？
 5. 请求完成后，什么可以立刻归还，什么要等 unlock/eviction，什么始终是全局 backing Tensor？
 
-如果这五题能用第 3 节的 A/B 数字回答，Atlas 的目标就达到了。接下来要深入机制时，回到 Day05 的 Full Attention 分配/回收主线；要追 latent、index sidecar 或 state slot，再进入 Day06 或后续 Linear Attention 文档。
+如果这五题能用第 3 节的 A/B 数字回答，Atlas 的目标就达到了。接下来要深入机制时，回到第1篇的 Full Attention 分配/回收主线；要追 latent、index sidecar 或 state slot，再进入第2篇或后续 Linear Attention 文档。
 
 ![SGLang state ownership 总图（迷路时再看）](assets/sglang_state_ownership.svg)
 

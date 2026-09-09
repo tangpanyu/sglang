@@ -1,6 +1,6 @@
-# Day 07｜先分清 Mamba state，再沿 SGLang 源码追 KDA recurrent cache
+# 3｜先分清 Mamba state，再沿 SGLang 源码追 KDA recurrent cache
 
-> 源码基线：本文按 SGLang checkout 的 `db017e34902b51e1fd1ac7ebbedaf720c75b374d`（2026-09-02）整理。源码链接使用仓库相对路径；行号只用于快速定位，切换版本后请优先按函数名重新搜索。
+> 源码基线：本文按当前 SGLang checkout 的 `a478b5d7e74d83a9bcdb31440c2ffd64b01a2d66`（2026-09-08）整理。源码链接使用仓库相对路径；行号只用于快速定位，切换版本后请优先按函数名重新搜索。
 >
 > 本文采用 **hybrid** 写法：默认你已经理解 KDA 的 delta-rule，只用一小节把公式映射到 state；默认你不了解 Mamba，因此先补足读懂 `MambaPool`、`mamba_pool_idx` 和 `MAMBA` component 所需的 Mamba/SSM 心智模型，再进入源码。
 
@@ -30,7 +30,7 @@
 
 ### 0.2 本文怎么读
 
-第一遍按正文依次回答五件事：state 是什么、谁创建它、请求怎样拿到 slot、kernel 怎样原地推进、tree 怎样保存 checkpoint。KDA 公式只负责解释 `temporal` 的 payload；Mamba 公式只负责解释为什么运行时可以按“每请求一个状态槽”管理。
+建议按三层读：**必读主线**是第 0–11.2 节（state → row/slot → KDA extend/decode → checkpoint → release）；**第二遍**再读第 11.3–11.4 节的调试 invariants；第 12–13 节是进阶分支和源码索引。KDA 公式只负责解释 `temporal` 的 payload；Mamba 公式只负责解释为什么运行时可以按“每请求一个状态槽”管理。
 
 源码片段会标明“真实源码摘录”或“省略分支后的骨架”。每一段后都继续回答：**现在手里有什么，下一跳拿什么**。如果只是想 debug，可直接跳到第 11 节的断点表。
 
@@ -90,6 +90,8 @@ $$
 \longmapsto(o_t,H_t).
 $$
 
+这里把 state 写成 $[d_v,d_k]$ 是便于推导的记号；KDA kernel 的物理 tile 按 `[V,K]`（见 [`fused_sigmoid_gating_delta_rule_update_kernel`](../../python/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py#291-346)）解释。Kimi 当前配置中两维相同，转置约定不会改变 shape；换成非对称 $d_v/d_k$ 的实现时不要直接套用这张表。
+
 Kimi 的 Q/K/V 在进入 delta rule 前还有短 causal convolution，所以实际 slot 需要同时保存：
 
 | `MambaPool.State` 字段 | KDA 中的 payload | 不是它 |
@@ -141,41 +143,23 @@ def kda_extend(slot, projected_tokens, state_pool):
 
 KV prefix 的已完成 slot 通常只读，多个请求可以共同引用；recurrent state 的下一步却会原地把 $H_p$ 改成 $H_{p+1}$。假设两个请求都命中前缀 $P$，正确关系是：
 
-```mermaid
-flowchart LR
-    P["radix checkpoint c<br/>state(P)，只读"] -->|copy state| A["request A active slot a"]
-    P -->|copy state| B["request B active slot b"]
-    A -->|继续 token x| AX["state(P+x)，只改 a"]
-    B -->|继续 token y| BY["state(P+y)，只改 b"]
-```
-
-这就是 COW。checkpoint slot 的值必须保持不变，才能继续服务之后命中同一 prefix 的请求。
+这就是 COW：radix checkpoint `c` 保持只读，A/B 分别复制到可写的 `a`/`b`，后续 token 只修改各自 destination。第 2 节的 timeline 下半部分把这组 source/destination 和对应源码断点画在一起；checkpoint slot 的值必须保持不变，才能继续服务之后命中同一 prefix 的请求。
 
 ## 2. 首屏总览：两套地址、一个请求生命周期
 
-下面这张自制图回答“Full/MLA token cache 与 KDA recurrent cache 怎样同时挂在一个请求上”。它没有引用外部算法图，因为这里画的是 SGLang 项目专有的对象和地址关系。
+先问一个定位问题：**同一个 request row 为什么同时指向 token loc 和 recurrent slot，而且两者的 owner、增长方式、释放时机都不同？** 下面的图只回答这一个问题；它没有引用外部算法图，因为这里画的是 SGLang 项目专有的对象和地址关系。
 
 ![KDA 请求的两套持久状态地址空间](assets/day07_kda_state_map.svg)
 
-图里的 `r` 是 request row，`s` 是 Full/MLA token slot，`m` 是 recurrent state slot。三者不是同一个整数，也不要求相等。
+图里的 `r` 是 request row，`s` 是 Full/MLA token slot，`m` 是 recurrent state slot。三者不是同一个整数，也不要求相等。图中数字和 shape 是便于阅读的教学值；真正的 layer 数、slot 数和 dtype 由配置决定。
 
-状态机标签是为了 debug 定义的观察阶段，不是代码中的 enum：
+图后立刻回到源码：`ReqKvInfo.req_pool_idx` 与 `mamba_pool_idx` 是请求级句柄（[`ReqKvInfo`](../../python/sglang/srt/managers/schedule_batch.py#848-877)）；`HybridReqToTokenPool.alloc()` 维护 row → state-slot 映射（[`alloc`](../../python/sglang/srt/mem_cache/memory_pool.py#1351-1401)）；`mamba2_layer_cache()` 再按 layer id 取出该层的 `conv/temporal` view（[`mamba2_layer_cache`](../../python/sglang/srt/mem_cache/memory_pool.py#1414-1426)）。树上的 FULL/MAMBA value 只是 token loc 与 state-slot handle，真正的 payload 仍在各自 pool（[`ComponentType`](../../python/sglang/srt/mem_cache/unified_cache/component_type.py#6-30)、[`MambaComponent.finalize_match_result_in_cache`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#187-216)）。
 
-```mermaid
-stateDiagram-v2
-    [*] --> NEW
-    NEW --> MATCHED: init_next_round_input / prefix lookup
-    MATCHED --> ADMITTED: PrefillAdder 预算通过并锁节点
-    ADMITTED --> MATERIALIZED: 绑定 row、token loc、active state slot
-    MATERIALIZED --> EXTEND: clear/COW 后执行 KDA forward_extend
-    EXTEND --> CHECKPOINTED: cache_unfinished_req / chunk stash
-    CHECKPOINTED --> DECODE: prepare_for_decode
-    DECODE --> DECODE: 追加 token loc，原地推进同一 active slot
-    DECODE --> FINISHED: cache_finished_req
-    CHECKPOINTED --> EVICTED: tree eviction
-    FINISHED --> [*]
-    EVICTED --> [*]
-```
+接着看时间问题：**一个 active slot 在 prefill、decode、cache、fork 之间，哪几步会改变 payload，哪几步只改变 owner？** 下面这张 timeline 是主线的唯一执行图；状态名仍是本文的 debug 标签，不是源码里的 enum。`c=12`、`m=5` 等均为教学值，`CHECKPOINTED` 只在确实有可恢复 snapshot 且进入 `cache_*` 边界时成立。
+
+![KDA state timeline：分配、prefill、两步 decode、cache 与 fork](assets/day07_kda_execution_timeline.svg)
+
+图后的源码映射按图中四段读：A 的 fresh `clear` 来自 [`HybridReqToTokenPool.alloc`](../../python/sglang/srt/mem_cache/memory_pool.py#1351-1401)，命中 prefix 的 `COW` 由 [`MambaComponent.finalize_match_result_in_cache`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#187-216) 预约，再由 forward 前 deferred mutation 执行（[`_maybe_execute_deferred_mamba_cow_and_clear`](../../python/sglang/srt/model_executor/model_runner.py#1678-1724)）；B 的 prefill 扫描对应 [`KDAAttnBackend.forward_extend`](../../python/sglang/srt/layers/attention/linear/kda_backend.py#693-828)；C/D 的同 slot 原地 decode 对应 [`KDAAttnBackend.forward_decode`](../../python/sglang/srt/layers/attention/linear/kda_backend.py#531-691)；E 的 tree 发布、请求释放和 eviction 对应 [`cache_unfinished_req/cache_finished_req`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#838-1048)、[`prepare_for_caching_req`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#529-606) 与 [`cleanup_after_caching_req`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#608-653)。图中虚线 fork 只表示 source/destination 的句柄关系，不表示共享可写 state。
 
 `EXTEND`、`CHECKPOINTED` 的真实证据是下面这些 mutation，而不是某个 `req.state` 字段。
 
@@ -186,7 +170,7 @@ stateDiagram-v2
 | [alloc_for_extend · L282–L389](../../python/sglang/srt/mem_cache/allocation.py#282-389) | ADMITTED → MATERIALIZED | 绑定 row、token loc、row→Mamba slot | chunk continuation 再分配 active state |
 | deferred clear/COW | MATERIALIZED 内部初始化 | 新 slot 清零，或 checkpoint → active slot | KDA 先读未初始化的 slot |
 | [KDAAttnBackend.forward_extend · L693–L828](../../python/sglang/srt/layers/attention/linear/kda_backend.py#693-828) | MATERIALIZED → EXTEND | conv/temporal 从前缀状态推进到本轮末端 | 修改 tree checkpoint slot |
-| [cache_unfinished_req · L925–L1048](../../python/sglang/srt/mem_cache/unified_radix_cache.py#925-1048) | EXTEND → CHECKPOINTED | insert、rematch、canonical loc 回写、lock handoff | 释放请求仍要继续写的 active slot |
+| [cache_unfinished_req · L925–L1048](../../python/sglang/srt/mem_cache/unified_radix_cache.py#925-1048) | EXTEND → CHECKPOINTED（有可发布 snapshot 时） | insert、rematch、canonical loc 回写、lock handoff | 释放请求仍要继续写的 active slot |
 | [prepare_for_decode · L3287–L3344](../../python/sglang/srt/managers/schedule_batch.py#3287-3344) / forward_decode | CHECKPOINTED → DECODE | 每步追加 token loc；同一 active state 原地推进 | 每个 decode token 新建 Mamba slot |
 | [cache_finished_req · L838–L924](../../python/sglang/srt/mem_cache/unified_radix_cache.py#838-924) | DECODE → FINISHED | row/active slot 所有权释放或转交给 tree | tree value 仍指向已归还 allocator 的 slot |
 | tree eviction | CHECKPOINTED → EVICTED | 按 component 释放 token loc/state slot | 把 token id 当物理资源释放 |
@@ -250,7 +234,7 @@ ReqKvInfo 把 Full/MLA 和 Mamba 的生命周期并列放在一个请求对象�
 | cache_protected_len | int | 树为请求保护的前缀边界 | match/insert |
 | kv_allocated_len | int | row 已覆盖到的逻辑长度 | extend/decode allocator |
 | kv_committed_len | int | scheduler 认为已提交的 KV 长度 | batch bookkeeping |
-| mamba_pool_idx | shape [1] 的 tensor | 请求当前可写的 Mamba slot | hybrid pool / COW |
+| mamba_pool_idx | 当前分配路径返回的 0-D tensor（`mid[0]`；字段注释仍写 `(1)`） | 请求当前可写的 Mamba slot | hybrid pool / COW |
 | mamba_cow_src_index | tensor 或 None | 下一次 extend 前要复制的 checkpoint slot | MAMBA component |
 | mamba_needs_clear | bool | 新 slot 是否需要清零 | hybrid pool |
 | mamba_last_track_seqlen | int 或 None | extra-buffer 路径最后一个可缓存 checkpoint 的长度 | track metadata |
@@ -280,7 +264,7 @@ $$
 | `MambaSlotAllocator` | 可分配/归还的 state slot ID | 启动时创建，alloc/free 改 free-list | request admission、COW、checkpoint、eviction；server 常驻 |
 | `MambaPool.mamba_cache.conv` | `[num_kda_layers, mamba_slots+1, ...]` 的卷积滑窗 | causal-conv extend/decode | 下一轮卷积或 checkpoint copy；server 常驻 |
 | `MambaPool.mamba_cache.temporal` | `[num_kda_layers, mamba_slots+1, ...]` 的 KDA recurrent matrix | KDA extend/decode kernel | 下一轮 KDA 或 checkpoint copy；server 常驻 |
-| `node.component_data[MAMBA].value` | checkpoint slot handle | `prepare_for_caching_req()` / `commit_insert_component_data()` | prefix match/COW/eviction；tree entry 生命周期 |
+| `node.component_data[MAMBA].value` | 通常为长度 1 的 slot-handle tensor（不是 state bytes） | `prepare_for_caching_req()` / `commit_insert_component_data()` | prefix match/COW/eviction；tree entry 生命周期 |
 
 `ReqToTokenPool` 的 row 0 是 dummy，真实 row 从 1 开始，见 [ReqToTokenPool · L257–L337](../../python/sglang/srt/mem_cache/memory_pool.py#257-337)。`MambaPool` 同样给 slot 0 留 dummy；普通布局中 conv/temporal 的 `size + 1` 维度和初始化见 [MambaPool.__init__ · L499–L613](../../python/sglang/srt/mem_cache/memory_pool.py#499-613)，最终封装进 `self.mamba_cache` 的位置见 [memory_pool.py · L824–L861](../../python/sglang/srt/mem_cache/memory_pool.py#824-861)。
 
@@ -290,7 +274,7 @@ $$
 \texttt{conv}[l,m],\qquad \texttt{temporal}[l,m].
 $$
 
-`mamba_pool_idx=m` 不是“只缓存一层”，而是让所有 KDA 层在各自的 layer slice 上使用同一个请求槽编号。`clear_slots(m)` 与 `copy_from(src, m)` 也会跨所有 KDA 层一起处理这两类 payload。
+`mamba_pool_idx=m` 不是“只缓存一层”，而是让本 rank 的所有 KDA 层在各自的 layer slice 上使用同一个请求槽编号。`clear_slots(m)` 与 `copy_from(src, m)` 也会跨本 pool 中的 KDA 层一起处理这两类 payload；TP/层切分时不要把它理解成跨 rank 的同一块物理行。
 
 注意：
 
@@ -350,9 +334,9 @@ ComponentType 是整数枚举：FULL=0、SWA=1、MAMBA=2，见 [component_type.p
 | component 槽 | `value` 的典型内容 | payload 的真正 owner |
 |---|---|---|
 | `node.component_data[FULL]` | token loc 向量 | Full/MLA token pool |
-| `node.component_data[MAMBA]` | shape `[1]` 的 state-slot handle | `MambaPool` 或 checkpoint pool |
+| `node.component_data[MAMBA]` | 通常为长度 1 的 state-slot handle | `MambaPool` 或 checkpoint pool |
 
-这里的 FULL 是组件索引/命名空间，不是 token 坐标、page 坐标或 GPU 行号。node.component_data[FULL].value 的 value 通常是 token loc 向量；node.component_data[MAMBA].value 通常是 shape [1] 的 state-slot handle。真正的 K/V 或 recurrent matrix 仍在各自 pool。
+这里的 FULL 是组件索引/命名空间，不是 token 坐标、page 坐标或 GPU 行号。`node.component_data[FULL].value` 通常是 token loc 向量；`node.component_data[MAMBA].value` 通常是长度 1 的 state-slot handle。请求字段 `req.kv.mamba_pool_idx` 则是分配时从 `mid[0]` 取出的 0-D scalar；需要批量索引时才显式 `unsqueeze(0)`。真正的 K/V 或 recurrent matrix 仍在各自 pool。
 
 ## 5. T1：NEW → MATCHED，prefix lookup 到底比较什么
 
@@ -491,7 +475,7 @@ if cow_src_indices:
 # 随后清掉一次性 batch metadata，再让 KDA layer 读取 conv/temporal
 ```
 
-MambaPool.clear_slots() 和 copy_from() 会同时处理所有 KDA 层的 conv、temporal state，见 [clear_slots/copy_from() · L962–L1039](../../python/sglang/srt/mem_cache/memory_pool.py#962-1039)。
+MambaPool.clear_slots() 和 copy_from() 会同时处理本 pool 中所有 KDA 层的 conv、temporal state，见 [clear_slots/copy_from() · L962–L1039](../../python/sglang/srt/mem_cache/memory_pool.py#962-1039)。
 
 这个阶段最容易误判的点是：mamba_pool_idx 可能是 virtual slot。调用物理 pool 的 copy/clear 前必须经过 translate_mamba_indices()；静态 pool 是 identity，unified pool 可能不是，见 [translate_mamba_indices() · L1403–L1412](../../python/sglang/srt/mem_cache/memory_pool.py#1403-1412)。
 
@@ -635,7 +619,7 @@ chunked 请求的 result processor 中间分支只减少 inflight_middle_chunks�
 
 Mamba component 在 [prepare_for_caching_req() · L529–L606](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#529-606) 根据路径选择有效 checkpoint 长度：
 
-- 无 extra buffer：通常使用 token_ids_len；ReplaySSM 打开时要扣掉尚未 flush 的 ring 深度；
+- 无 extra buffer：通常使用 token_ids_len；仅在 `is_finished=True` 的 ReplaySSM flush/finish 路径扣掉尚未 flush 的 ring 深度，普通 unfinished/cache 边界不要机械套用；
 - 有 extra buffer：使用 mamba_last_track_seqlen，即 track 到的对齐边界；
 - is_finished=True：可以把 active slot 作为待插入的 state handle（或写入 int8 checkpoint pool）；
 - is_finished=False：为树另分配 checkpoint slot，并把 active state copy 到该 slot，请求继续保留 active slot。
@@ -759,14 +743,19 @@ after = temporal[layer, slot, :1, :2, :2].detach().clone()
 
 可以在 debugger 的 conditional breakpoint 或临时日志中检查：
 
-```python
+```text
+# 以下是教学伪代码，不可直接粘贴运行；seq_lens 与 query_start_loc
+# 必须来自同一个 ForwardBatch/ForwardMetadata。
+
 # 地址分离
 req.kv.req_pool_idx is None or req.kv.req_pool_idx > 0
 req.kv.mamba_pool_idx is None or req.kv.mamba_pool_idx.item() > 0
 
-# row → state slot
-pool.get_mamba_indices(req_pool_indices)
-    == req_index_to_mamba_index_mapping[req_pool_indices]
+# row → state slot（示意代码；tensor 的 `==` 返回布尔 tensor，不是 Python bool）
+torch.equal(
+    pool.get_mamba_indices(req_pool_indices),
+    req_index_to_mamba_index_mapping[req_pool_indices],
+)
 
 # COW
 if mamba_cow_src_index is not None:
@@ -774,9 +763,10 @@ if mamba_cow_src_index is not None:
     assert src != dst  # 普通 fork
 
 # forward metadata
-forward_metadata.mamba_cache_indices >= 0  # 真实行
+torch.all(forward_metadata.mamba_cache_indices >= 0)  # 仅 eager/无 padding；CUDA graph 先排除 -1 sentinel
 query_start_loc[0] == 0
-query_start_loc[-1] == 实际 packed token 数
+packed_token_count = sum(seq_lens)
+query_start_loc[-1] == packed_token_count
 
 # prefix/tree
 len(req.prefix_indices) >= req.kv.cache_protected_len - page_size + 1
@@ -796,7 +786,7 @@ len(req.prefix_indices) >= req.kv.cache_protected_len - page_size + 1
 | decode 时报 packed T 不等于 batch | 错把 target verify/多 token 路径送进普通 packed decode |
 | tree value 看起来像一个小 tensor | 这是正常的：MAMBA value 是 slot handle；去 MambaPool 看矩阵 |
 
-## 12. 先不要展开的分支
+## 12. [进阶] 先不要展开的分支
 
 主线跑通后再进入这些分支，否则容易把状态机和优化细节混在一起：
 
@@ -815,7 +805,7 @@ len(req.prefix_indices) >= req.kv.cache_protected_len - page_size + 1
 - extra-buffer tracking：[schedule_batch.py#2760-2857](../../python/sglang/srt/managers/schedule_batch.py#2760-2857)
 - host/load-back MAMBA：[mamba_component.py#664-692](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#664-692)
 
-## 13. 源码导航：按状态机读，不按目录漫游
+## 13. [附录] 源码导航：按状态机读，不按目录漫游
 
 | 状态/问题 | 先读 | 再读 |
 |---|---|---|

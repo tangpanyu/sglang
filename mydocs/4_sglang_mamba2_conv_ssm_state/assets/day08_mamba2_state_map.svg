@@ -67,7 +67,7 @@
   <text x="884" y="458" class="small">Decode keeps address; mutates payload in place</text>
   <rect x="1240" y="375" rx="14" width="260" height="105" fill="#fff" stroke="#c4b5fd" class="card" filter="url(#shadow)"/>
   <text x="1262" y="407" class="boxTitle">MambaSlotAllocator</text>
-  <text x="1262" y="435" class="body">One slot spans all layers</text>
+  <text x="1262" y="435" class="body">One slot spans all local layers</text>
   <text x="1262" y="458" class="body">Owns IDs, not state bytes</text>
   <path d="M1172 428H1240" class="meta"/>
 
