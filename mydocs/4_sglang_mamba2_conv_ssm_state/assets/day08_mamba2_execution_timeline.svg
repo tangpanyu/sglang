@@ -66,7 +66,7 @@
   <rect x="960" y="447" rx="11" width="260" height="72" fill="#fff" stroke="#6ee7b7" class="card"/>
   <text x="980" y="476" class="body">scan / recurrent update</text><text x="980" y="499" class="mono">read/write temporal[slot]</text>
   <rect x="1275" y="447" rx="11" width="250" height="72" fill="#fff" stroke="#6ee7b7" class="card"/>
-  <text x="1295" y="476" class="body">gated norm + out_proj</text><text x="1295" y="499" class="mono">mamba_hidden_states</text>
+  <text x="1295" y="476" class="body">gate (+ optional RMSNorm) + out_proj</text><text x="1295" y="499" class="mono">mamba_hidden_states</text>
   <path d="M325 483H380" class="state"/><path d="M610 483H665" class="state"/><path d="M905 483H960" class="state"/><path d="M1220 483H1275" class="state"/>
 
   <rect x="45" y="655" rx="22" width="1590" height="305" fill="#f5efff" stroke="#a78bfa" class="card"/>

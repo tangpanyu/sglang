@@ -1,6 +1,8 @@
-# Day 06｜先搞懂 DSA，再看 SGLang 如何把它做成 KV Cache
+# 2｜先搞懂 DSA，再看 SGLang 如何把它做成 KV Cache
 
 > 本文从零解释 DSA，不假设你读过 DSA 论文、DeepSeek-DSA 实现或 SGLang 的其他缓存文档。先回答“DSA 在计算上做了什么”，再回答“这些中间结果为什么要这样存”，最后才进入 SGLang 的 pool、allocator、metadata 和 backend。
+>
+> **源码基线与主线条件**：按当前 checkout `a478b5d7e74d83a9bcdb31440c2ffd64b01a2d66`（2026-09-08 核对）阅读；主线固定 CUDA、decoder-only、eager、普通 DSA/MLA pool（main KV 为 BF16），先忽略 DCP/CP、speculative decoding、HiCache、具体量化后端和 CUDA graph。为让第 5 节的 `self.wk`、`self.weights_proj` 非融合摘录与实际代码一致，可在实验进程设置 `SGLANG_DISABLE_DSA_INDEXER_FUSION=1`；未设置时默认 CUDA 可能走融合路径，正文会明确标注哪些片段只适用于非融合分支。
 
 ## 0. 这篇只回答一个问题
 
@@ -41,6 +43,10 @@ flowchart LR
 
 不知道 MLA、RoPE、FP8、page table、SGLang scheduler 都没关系。它们会在各自第一次出现时定义。
 
+为让后面的地址图可复现，源码主线还假定 prefix/radix cache 已开启、未启用 HiSparse 或 DSA
+layer split，普通 CUDA pool 使用 `page_size=64`、`index_head_dim=128`；这些是当前实现的
+配置条件，不是 DSA 理论常数。第 10 节只在边界说明其他平台和融合路径。
+
 ### 0.2 先把三个词分开
 
 | 词 | 这里的含义 | 不是它 |
@@ -50,6 +56,27 @@ flowchart LR
 | KV cache | 把已经算过的历史 K/V 或等价表示保存起来，后续直接读取 | 不是 top-k 结果本身 |
 
 本文的阅读顺序固定为：**先用 dense attention 说明要优化什么 → 用一段小代码跑通 DSA → 解释为什么出现 main/sidecar 两份历史数据 → 再引入 `loc`、pool、metadata 和初始化调用链**。后面的章节不会把后面的运行时对象倒灌回前面的公式。
+
+### 0.3 持久状态的最小闭环（教学等价伪代码）
+
+在进入真实 pool 前，先把“当前输入如何产生两份历史 payload、下一轮如何消费它们”压成一个循环：
+
+```text
+# 教学等价实现，不是 SGLang API。
+state = {"locs": []}                           # owner：一套共享的地址引用
+for token in sequence:
+    loc = allocator.alloc_one()               # producer：发放同一个逻辑 loc
+    main[loc] = make_main_latent(token)       # owner：MLA main payload
+    index[loc] = make_index_key(token)        # owner：DSA sidecar payload
+    state["locs"].append(loc)
+    candidates = topk(read(index, state["locs"]))        # consumer 1
+    output = formal_mla(read(main, candidates))          # consumer 2
+```
+
+真实路径中，allocation 生产 `out_cache_loc`，`DSA backend`/`Indexer` 分别写 main 与
+sidecar，`DSAMetadata` 携带本轮边界和候选坐标，formal MLA 再读取候选 main rows；finish
+或 eviction 时两类 payload 必须随同一 `loc` 的 owner 一起转移/失效。这个循环只表达
+producer → owner → consumer 和生命周期，不表示实现真的按 Python token 循环。
 
 ## 1. 为什么需要 DSA？先从普通 attention 开始
 
@@ -372,10 +399,10 @@ if self.q_lora_rank is not None:
 
 | 教学变量 | SGLang 里先看哪里 | 该结果接下来被谁消费 |
 |---|---|---|
-| `q_lora` | [`forward_absorb_prepare`](../../python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py#318-444) | `Indexer.forward_cuda` 的 query 投影 |
+| `q_lora` | [`forward_absorb_prepare`](../../python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py#279-670) | `Indexer.forward_cuda` 的 query 投影 |
 | `qI` / `kI` | [`Indexer._get_q_k_bf16`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#462-568) | FP8 MQA logits kernel |
-| `gate` | [`_get_logits_head_gate`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#367-374) | FP8 logits 的 head 权重 |
-| `index_score` / `topk` | [`_get_topk_ragged`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1026-1151) 或 [`_get_topk_paged`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#794-966) | `topk_transform`，再交给 sparse MLA |
+| `gate` | [`_get_logits_head_gate`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#367-373) | FP8 logits 的 head 权重 |
+| `index_score` / `topk` | [`_get_topk_ragged`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1035-1238) 或 [`_get_topk_paged`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#794-975) | `topk_transform`，再交给 sparse MLA |
 
 源码会把若干步骤融合进 CUDA/FP8 kernel，所以函数名不一定逐字出现 `index_score`。先用这张表确认“谁生产、谁消费”，再读 kernel 内部优化。
 
@@ -402,6 +429,17 @@ if self.q_lora_rank is not None:
 1. **index sidecar**：小、便宜、适合扫描全历史；
 2. **main cache**：保存正式 MLA 所需的 `[c_KV | k_R]`，只在候选位置被读取。
 
+如果你刚读完第1篇，可以先用下面这张对照图把“地址契约”和“payload 解释”分开。它固定在
+本文的 plain prefix-cache 主线上：`req_to_token[r,p]`、allocator 和 `FULL.value` 仍然管理同一
+组 `loc`，变化的是每个 `loc` 在 MHA、MLA、DSA 中分别被哪种 backing tensor 解释。
+
+![从 MHA 到 MLA/DSA 的 cache payload 变化](assets/sglang_full_attention_delta.svg)
+
+读图时先看最上层的蓝色区域：它描述请求 row、`out_cache_loc` 和 prefix tree 的共同地址层，
+不是另一份 K/V。再向下看三列 payload：第1篇的 `loc` 同时索引 K/V 两个 row，第2篇的 MLA
+把 latent 与 RoPE key 放进一条 combined row，DSA 则在这条 main row 旁边增加独立的 index-key
+sidecar。后文追 `IndexKeyCache` 时，始终沿着这条“同一 `loc`、不同 carrier”的关系即可。
+
 ### 3.2 Formal MLA 如何消费候选行
 
 Indexer 选出候选位置集合 $\mathcal{S}_t$ 后，正式 attention 只取：
@@ -410,33 +448,48 @@ $$
 \{[c_{KV,s}\;|\;k_{R,s}]\mid s\in\mathcal{S}_t\}.
 $$
 
-为了只展示“候选行如何被消费”，下面给一个可以运行的简化 attention。它令教学用的 `q_formal` 与主行同维；真实 MLA 会先经过 absorbed projection，再得到等价的 logits。
+为了只展示“候选行如何被消费”，下面给一个可以运行的简化 attention。它把 main row
+拆成参与 logits 的 `k_R` 和参与 value 聚合的 `c_KV`，并把 absorbed projection 抽象成
+identity：因此 logits 同时包含 latent/nope 项和 RoPE 项，value 仍只聚合 `c_KV`。
 
 ```python
 import torch
 
 
-def toy_formal_attention(q_formal, main_rows, topk_indices):
+def toy_formal_attention(q_nope, q_rope, c_kv_rows, k_rope_rows, topk_indices):
     """
-    main_rows:    [S, kv_dim]   # 每一行可理解为 [c_KV | k_R]
-    topk_indices: [T, k]        # Indexer 产生的逻辑历史位置
+    q_nope:       [T, latent_dim]  # 已吸收投影的 query（教学中取 identity）
+    q_rope:       [T, rope_dim]    # RoPE query
+    c_kv_rows:    [S, latent_dim]  # value 侧的 MLA latent
+    k_rope_rows:  [S, rope_dim]    # logits 侧的 RoPE key
+    topk_indices: [T, k]            # Indexer 产生的逻辑历史位置
     """
-    selected = main_rows[topk_indices]                 # [T, k, kv_dim]
-    logits = torch.einsum("td,tkd->tk", q_formal, selected)
+    selected_c = c_kv_rows[topk_indices]               # [T, k, latent_dim]
+    selected_k = k_rope_rows[topk_indices]             # [T, k, rope_dim]
+    logits_nope = torch.einsum("td,tkd->tk", q_nope, selected_c)
+    logits_rope = torch.einsum("td,tkd->tk", q_rope, selected_k)
+    logits = logits_nope + logits_rope
     weights = torch.softmax(logits, dim=-1)             # [T, k]
-    output = torch.einsum("tk,tkd->td", weights, selected)
+    output = torch.einsum("tk,tkd->td", weights, selected_c)
     return output, weights
 
 
-q_formal = torch.randn(2, 6)                           # T=2, kv_dim=6
-main_rows = torch.randn(6, 6)                          # S=6
-topk_indices = torch.tensor([[1, 3], [0, 4]])         # T=2, k=2
-output, weights = toy_formal_attention(q_formal, main_rows, topk_indices)
-assert output.shape == (2, 6)
+q_nope = torch.randn(2, 6)                              # T=2, latent_dim=6
+q_rope = torch.randn(2, 4)                              # T=2, rope_dim=4
+c_kv_rows = torch.randn(6, 6)                           # S=6, latent_dim=6
+k_rope_rows = torch.randn(6, 4)                         # S=6, rope_dim=4
+topk_indices = torch.tensor([[1, 3], [0, 4]])           # T=2, k=2
+output, weights = toy_formal_attention(
+    q_nope, q_rope, c_kv_rows, k_rope_rows, topk_indices
+)
+assert output.shape == (2, 6)                           # 输出仍在 latent/value 维
 assert weights.shape == (2, 2)
 ```
 
-这段代码不是完整 MLA，而是为了看清箭头：`topk_indices` 选择 main cache 的行，`weights` 才是候选行上的正式 attention probability；不能把 indexer 的分数直接当成 `weights`。
+这段代码不是完整 MLA，而是为了看清箭头：`topk_indices` 同时选择同一 `loc` 的 `c_KV`
+与 `k_R`；latent/nope 与 RoPE 两项共同参与 logits，但 value 只聚合 `c_KV`。真实 MLA
+会用 `w_kc` 等 absorbed projection 替换这里的 identity。`weights` 才是候选行上的正式
+attention probability，不能把 indexer 的分数直接当成 `weights`。
 
 ### 3.3 为什么不能只保存 main cache
 
@@ -453,22 +506,17 @@ assert weights.shape == (2, 2)
 前 3 节已经把算法产物确定下来：Indexer 产生 `topk_indices`，formal MLA 消费候选主 KV。
 现在只追这一条源码路径，不再把初始化、写入和读取混成一个时间点：
 
-```mermaid
-flowchart LR
-    H["hidden_states<br/>当前层输入"] --> P["forward_absorb_prepare"]
-    P --> Q["q_lora"]
-    P --> I["Indexer.forward_cuda"]
-    Q --> I
-    I --> K["q/k/gate<br/>FP8 logits + top-k"]
-    K --> S["IndexKeyCache<br/>sidecar kI + scale"]
-    K --> T["topk routing result"]
-    P --> A["forward_absorb_core<br/>attn_mqa"]
-    A --> M["MLATokenToKVPool<br/>main [c_KV | k_R]"]
-    T --> X["topk_transform<br/>可能已在 Indexer 融合"]
-    X --> F["sparse MLA backend"]
-    M --> F
-    F --> O["formal logits → softmax → output"]
-```
+为了把这条依赖顺序和真实 eager forward 对齐，下面用一张时序图替代重复的概念箭头图。它把
+“metadata 先准备、Indexer 先产出 sidecar/top-k、backend 再写入并读取 main”放在同一张图里，
+并把 `skip_topk` 作为边界分支单独标出。
+
+![DSA eager forward 的 metadata、sidecar、top-k 与 main cache 生命周期](assets/mla_dsa_lifecycle.svg)
+
+读图时沿着 0→4 走：调度/分配先补好 `req_to_token` 和 `out_cache_loc`，eager runner 的
+[`init_forward_metadata`](../../python/sglang/srt/layers/attention/dsa_backend.py#777-1075) 再构造页表与序列边界；层内准备把 `q_lora`、`k_nope`、`k_pe` 交给
+Indexer，Indexer 用同一批写地址保存 sidecar 并产生候选，最后 attention backend 写 main
+latent cache 并按候选读取。图中箭头表示数据就绪依赖，不表示 CUDA stream 一定串行；`skip_topk`
+层的 0-row sidecar 占位和上一层 top-k 复用属于后续边界，不要把它误读成第二套地址映射。
 
 这张图只回答一个问题：**同一轮 forward 中，Indexer 产出的索引如何和 main KV 在 backend
 汇合**。Scheduler、allocator 和 pool 构造是这条路径的“创建背景”，放到第 6 节再看。
@@ -499,7 +547,7 @@ if self.should_run_indexer(prev_topk_indices):
     )
 ```
 
-源码入口：[`forward_absorb_prepare`](../../python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py#318-444)。
+源码入口：[`forward_absorb_prepare`](../../python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py#279-670)。
 
 `x` 和 `q_lora` 不是同一份东西：`q_lora` 提供 query 侧低秩表示，`x` 仍用于生成 index
 key 和 head gate。`forward_batch` 携带本轮的序列长度、请求位置和写入位置；page table 等
@@ -516,7 +564,8 @@ weights/topk_result`。
 > - **下一跳**：`act_quant(query)` 与 `_store_index_k_cache(key, ...)`。
 > - **先忽略什么**：dual stream、fused weights 和 context parallel 的 all-gather。
 
-下面是**真实源码的局部摘录**，省略了 stream/fusion 分支，但保留 shape 和状态变化：
+下面是**真实源码的非融合分支局部摘录**（对应上面设置的环境变量），省略了 stream/CP
+分支，但保留 shape 和状态变化：
 
 ```python
 # dsa_indexer.py::_get_q_k_bf16
@@ -532,6 +581,8 @@ k_rope, _ = torch.split(
     key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
 )
 q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
+self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
 query = self._maybe_rotate(query)
 key = self._maybe_rotate(key)
 ```
@@ -545,7 +596,8 @@ key = self._maybe_rotate(key)
 
 ### 5.3 `forward_cuda` 同时生产 sidecar 和 top-k
 
-`forward_cuda` 的主干可以压缩成下面这个**忠实骨架**；它不是可直接运行的替代实现：
+在 eager、非融合、没有触发 `k-only` 快路径的条件下，`forward_cuda` 的主干可以压缩成下面
+这个**忠实骨架**；它不是可直接运行的替代实现（`metadata` 已由入口按 layer/batch 取得）：
 
 ```python
 # dsa_indexer.py::forward_cuda，省略 graph/CP/平台分支
@@ -572,7 +624,7 @@ else:
 return maybe_capture_indexer_topk(layer_id, topk_result)
 ```
 
-源码入口：[`Indexer.forward_cuda`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1571-1911)。
+源码入口：[`Indexer.forward_cuda`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1580-1920)。下方 `self.wk`/`self.weights_proj` 片段只对应设置 `SGLANG_DISABLE_DSA_INDEXER_FUSION=1` 的非融合路径；默认 CUDA 融合时应改看 `_fused_k_weights` 与 `_scale_head_gates`。
 
 这里发生了两个不同的状态变化：
 
@@ -606,7 +658,7 @@ pool.set_index_k_scale_buffer(
 )
 ```
 
-写入入口：[`_store_index_k_cache`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1471-1551)；pool 接口：[`set_index_k_scale_buffer`](../../python/sglang/srt/mem_cache/memory_pool.py#4538-4548)。
+写入入口：[`_store_index_k_cache`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1480-1560)；上面的代码只展示它的非融合 fallback，当前函数还含 CUDA fused store 和 AITER 分支。pool 接口：[`set_index_k_scale_buffer`](../../python/sglang/srt/mem_cache/memory_pool.py#4541-4548)。
 
 因此这里的 producer/owner/consumer 是：
 
@@ -715,6 +767,18 @@ $$
 \mathrm{main\_row}[\mathrm{loc}] = [c_{KV}\;|\;k_R].
 $$
 
+先用下面的具体页布局图把这个抽象地址钉住。图中选取当前 CUDA DSA 常见的 `page_size=64`、
+`kv_lora_rank=512`、`qk_rope_head_dim=64` 和 `index_head_dim=128`，数字只用于说明寻址，
+不是 DSA 理论要求的固定常数。
+
+![DSA main latent 与 index-key sidecar 共享同一 loc](assets/dsa_coupled_page_layout.svg)
+
+图的上半部分把 `out_cache_loc`、`req_to_token` 和 page/offset 对齐；下半部分显示两块
+独立存储：main 的每个 row 是 `[c_kv(512) | k_rope(64)]`，sidecar 则在 page 内分别排列
+FP8 key 和 scale。绿色结论是关键：allocator/tree 只维护一套 loc 的可达性与保护状态，
+不能因为 sidecar 有自己的 buffer 就再造一张 request-to-token 表。接下来的源码摘录只需回答
+两个问题——谁把同一个 loc 写进 main，谁把它写进 sidecar。
+
 `MLATokenToKVPool.set_mla_kv_buffer` 接收 `loc`、latent 侧 key 和 RoPE 侧 key，并把它们
 写入对应 layer 的 `kv_buffer`：
 
@@ -743,7 +807,7 @@ assert self.page_size == 64
 self.index_key_cache = self._create_index_key_cache()
 ```
 
-DSA pool 定义：[`DSATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#4421-4489)。
+DSA pool 定义：[`DSATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#4421-4567)。
 
 ## 7. formal MLA：top-k 如何变成真正的 cache 读取
 
@@ -770,7 +834,7 @@ attn_output = self.attn_mqa(
 )
 ```
 
-源码入口：[`forward_absorb_core`](../../python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py#672-760)。
+源码入口：[`forward_absorb_core`](../../python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py#672-925)。
 
 ### 7.1 backend 先写本轮 main KV
 
@@ -792,7 +856,7 @@ if k is not None:
         )
 ```
 
-真实路径：[`forward_extend`](../../python/sglang/srt/layers/attention/dsa_backend.py#1874-2182) 与 [`forward_decode`](../../python/sglang/srt/layers/attention/dsa_backend.py#2184-2288)。
+真实路径：[`forward_extend`](../../python/sglang/srt/layers/attention/dsa_backend.py#1874-2182) 与 [`forward_decode`](../../python/sglang/srt/layers/attention/dsa_backend.py#2184-2352)。
 
 此时同一个 `loc` 上已经有两类 payload：Indexer 写入的 `kI_fp8 + scale`，以及 backend
 写入的 `[c_KV | k_R]`。下一步不是再次计算 index score，而是把 `topk_indices` 变成主 KV
@@ -800,8 +864,9 @@ kernel 能使用的坐标。
 
 ### 7.2 `topk_indices` 不是 `loc`：未融合路径才在 backend 转换
 
-`BaseIndexerMetadata.topk_transform` 的契约已经说明：返回值不一定还是输入 logits 的普通
-top-k 列号；如果启用 fused top-k，Indexer 阶段就可能把 page/ragged transform 一起做完。
+[`BaseIndexerMetadata.topk_transform`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer_metadata.py#73-90)
+的契约已经说明：返回值不一定还是输入 logits 的普通 top-k 列号；如果启用 fused top-k，
+Indexer 阶段就可能把 page/ragged transform 一起做完。
 下面先看 **未启用 fused top-k 的 decode 分支**，它最适合建立“逻辑列号 → page/slot”直觉：
 
 ```python
@@ -825,7 +890,8 @@ return self._forward_flashinfer_sparse_mla(
 )
 ```
 
-坐标转换实现：[`transform_index_page_table_decode`](../../python/sglang/kernels/ops/attention/dsa/transform_index.py#45-64)。
+坐标转换入口：[`transform_index_page_table_decode`](../../python/sglang/kernels/ops/attention/dsa/transform_index.py#22-26)；
+其中的固定宽度 Triton kernel 实现见同文件 [`transform_index_page_table_decode_kernel`](../../python/sglang/kernels/ops/attention/dsa/transform_index.py#57-76)。
 
 ```mermaid
 flowchart LR
@@ -858,20 +924,23 @@ flowchart LR
 ```text
 cache_seqlens_int32   = [当前每个请求的可见长度]
 real_page_table       = [每个请求的物理 page 表]
-dsa_cache_seqlens_int32 = [每个请求实际保留的 top-k 长度]
-page_table_1          = [token 粒度的 kernel-facing 映射]
-indexer_k_start_end   = [(历史起点, 历史终点)]
+dsa_cache_seqlens_int32 = [每个 query/展开 token 实际保留的 top-k 长度]
+page_table_1          = [page_size=1 的表；仅 fused-decode CUDA graph 可为 None]
+indexer_k_start_end   = [prefill 时每个 query token 的 (k 起点, k 终点)；起点按请求累计]
 indexer_seq_lens      = [Indexer 扫描的历史长度]
 topk_indices_offset   = [prefill ragged 路径的行偏移，可为空]
 ```
 
-在 fused decode graph 中，`page_table_1` 可能被刻意省掉；这时使用 compact 的
-`real_page_table`/融合 top-k 路径。这个例外不改变“逻辑候选需要被转换成 kernel 可读坐标”
-的契约。
+在 fused decode graph 中，`page_table_1` 可能被刻意省掉；ragged 路径也可能直接把
+`topk_indices` 作为 kernel-facing 候选。`indexer_k_start_end` 则按 query token 给出
+flattened buffer 的 `(ks, ke)` 范围（`ks` 随请求累计，`ke` 再加该 token 的可见长度），
+不应解读成单个请求的一对“历史起点/终点”。这些表示差异不改变“逻辑候选需要被转换成
+kernel 可读坐标”的契约。
 
-producer/consumer 可以这样记：metadata builder 产生这些字段，Indexer 用 page table 和
-序列边界读 sidecar，backend 再用 `topk_indices_offset` 或 `transform_index_page_table_*`
-把候选路由交给 sparse MLA。字段定义见 [`DSAMetadata`](../../python/sglang/srt/layers/attention/dsa_backend.py#193-254)。
+producer/consumer 可以这样记：[`init_forward_metadata`](../../python/sglang/srt/layers/attention/dsa_backend.py#777-1075)
+产生这些字段，Indexer 用 page table 和序列边界读 sidecar，backend 再用
+`topk_indices_offset` 或 `transform_index_page_table_*` 把候选路由交给 sparse MLA。字段
+定义见 [`DSAMetadata`](../../python/sglang/srt/layers/attention/dsa_backend.py#193-254)。
 
 ## 8. 地址生命周期：复用、迁移和释放
 
@@ -905,20 +974,20 @@ def move_kv_cache(self, tgt_loc, src_loc):
 
 ### 8.3 释放回收的是地址，不等于逐字节清零
 
-allocator 释放 `loc/page` 后，下一次分配可能复用同一地址；新 token 会重新写 main 和
-sidecar。读 debug 日志时，把“request row 从 radix tree 移除”“地址回到 free-list”和
-“GPU buffer 是否清零”分成三个问题。
+allocator 释放 `loc/page` 后，下一次分配可能复用同一地址；生产 top-k 的层会重新写 main
+和 sidecar，`skip_topk` 层则按上一层路由复用规则不写自己的 sidecar。读 debug 日志时，
+把“request row 从 radix tree 移除”“地址回到 free-list”和“GPU buffer 是否清零”分成三个问题。
 
 ## 9. 源码阅读顺序：第一遍主线和第二遍 debug
 
 第一遍只走一条不会迷路的主线：
 
 1. 读本文第 1～3 节，确认 `qI/kI/gate/top-k` 和两类 payload 的理论契约；
-2. 看 [`forward_absorb_prepare`](../../python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py#279-444)，确认 `hidden_states/q_lora → Indexer`；
+2. 看 [`forward_absorb_prepare`](../../python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py#279-670)，确认 `hidden_states/q_lora → Indexer`；
 3. 看 [`Indexer._get_q_k_bf16`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#462-568)，确认 query/key、norm、RoPE；
-4. 看 [`Indexer.forward_cuda`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1571-1911)，确认量化、sidecar 写入和 top-k；
-5. 看 [`DSATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#4421-4548)，确认两个 payload 如何共享 `loc`；
-6. 看 [`dsa_backend.forward_extend`](../../python/sglang/srt/layers/attention/dsa_backend.py#1874-2182) / [`forward_decode`](../../python/sglang/srt/layers/attention/dsa_backend.py#2184-2288)，确认 main 写入、坐标转换和 sparse read；
+4. 看 [`Indexer.forward_cuda`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1580-1920)，确认量化、sidecar 写入和 top-k；
+5. 看 [`DSATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#4421-4567)，确认两个 payload 如何共享 `loc`；
+6. 看 [`dsa_backend.forward_extend`](../../python/sglang/srt/layers/attention/dsa_backend.py#1874-2182) / [`forward_decode`](../../python/sglang/srt/layers/attention/dsa_backend.py#2184-2352)，确认 main 写入、坐标转换和 sparse read；
 7. 最后回看 [`ModelRunner.alloc_memory_pool`](../../python/sglang/srt/model_executor/model_runner.py#881-903) 和 [`KVCacheConfigurator._build_dsa_kv_pool`](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1489-1540)，理解这些 owner 如何被创建。
 
 第二遍按现象反查字段：
@@ -935,7 +1004,7 @@ sidecar。读 debug 日志时，把“request row 从 radix tree 移除”“地
 
 ### 10.1 一个容易误判的优化：历史不超过 `index_topk`
 
-当可见历史长度 $S\le k$ 时，top-k 的结果本来就是全部有效位置，Indexer 计算完整 logits 再排序没有信息收益。源码的 [`Indexer._should_skip_logits_computation`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#396-460) 会在支持的路径走 “k-only” 快路径：仍然写入需要的 `kI`，但跳过这次 logits/top-k 计算。这个优化没有改变 DSA 的理论定义，只是利用了“候选数已经覆盖全部历史”这一边界条件。
+当可见历史长度 $S\le k$ 时，top-k 的结果本来就是全部有效位置，Indexer 计算完整 logits 再排序没有信息收益。源码的 [`Indexer._should_skip_logits_computation`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#395-460) 会在支持的路径走 “k-only” 快路径：仍然写入需要的 `kI`，但跳过这次 logits/top-k 计算。这个优化没有改变 DSA 的理论定义，只是利用了“候选数已经覆盖全部历史”这一边界条件。
 
 另外，配置为复用上一层 top-k 的层不会重新写 index-K；[`IndexKeyCache._layer_num_pages`](../../python/sglang/srt/mem_cache/index_key_cache.py#40-43) 会给这类层建立 0-row placeholder。读代码时把它看成“该层复用路由”的实现优化，不要误解成 sidecar 的地址契约消失了。
 

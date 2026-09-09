@@ -188,6 +188,9 @@ work_dirs/
 
 !logo.png
 !docs/images/*.png
+# This external reference figure is part of the Day05 lesson and must travel
+# with the Markdown file despite the repository-wide plot-image ignore rule.
+!mydocs/1_sglang_full_attention_kv_cache/assets/flashinfer_paged_kv_layout.png
 
 # Prerequisites
 *.d

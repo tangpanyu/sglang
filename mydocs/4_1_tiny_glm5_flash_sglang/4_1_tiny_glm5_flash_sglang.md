@@ -1,8 +1,10 @@
-# Day 08｜Tiny GLM-5.3-Flash：从 PyTorch reference 到 SGLang CUDA runner
+# 4.1｜Tiny GLM-5.3-Flash：从 PyTorch reference 到 SGLang CUDA runner
 
 > 本文只记录当前仓库中的 tiny reference model 和 SGLang adapter。它不是 GLM-5.3-Flash 的精确 kernel 或 checkpoint 实现，也不加载原始 GLM 权重。
 >
 > 范围：随机权重、decoder-only、4 层、单 GPU smoke test。先解释 reference model 的精确数据流，再解释 SGLang adapter 怎样把同一层次结构接到已有 KDA、MLA/DSA、mHC 和 MoE runtime。SM120 与 SM86 的 backend 边界单独列出。
+
+如果只想先认识 SGLang 的整体请求主线，请先读 [0｜SGLang Serving State 对象地图的总览](../0_sglang_state_object_atlas/0_sglang_state_object_atlas.md)，再回到本文的 GLM5 专项路径。
 
 ## 0. 先看最短主线
 
@@ -263,7 +265,7 @@ MoE: SGLang default Triton fallback
 mHC: eager path
 ~~~
 
-`flashinfer_sparse_mla_forward()` 在 [`flash_mla_sm120.py`](../../python/sglang/kernels/ops/attention/flash_mla_sm120.py#610-766) 中先尝试 FlashInfer；如果 kernel dispatch table 没有 tiny shape，就进入 `_torch_sparse_mla_forward()`，直接解码 DSA packed cache 并做 selected-token attention。
+`flashinfer_sparse_mla_forward()` 在 [`flash_mla_sm120.py`](../../python/sglang/kernels/ops/attention/flash_mla_sm120.py#610-722) 中先尝试 FlashInfer；如果 kernel dispatch table 没有 tiny shape，就进入 `_torch_sparse_mla_forward()`，直接解码 DSA packed cache 并做 selected-token attention。
 
 ### 6.2 SM86 当前需要另一条路径
 
