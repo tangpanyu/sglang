@@ -109,6 +109,18 @@ _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
+
+
+def get_dsa_index_storage_bytes_per_token(index_head_dim: int) -> int:
+    """Return the physical DSA index-cache bytes for one logical key row.
+
+    SM80/SM86 keep BF16 rows in the byte-backed cache facade because those
+    architectures cannot execute the FP8 index path.  Newer CUDA devices use
+    the compact FP8 key plus one FP32 scale per row.
+    """
+    if _is_cuda and torch.cuda.get_device_capability()[0] < 9:
+        return index_head_dim * 2
+    return index_head_dim + index_head_dim // 128 * 4
 # `SGLANG_AITER_KV_CACHE_LAYOUT` is only meaningful on the ROCm AITER backend
 # (HIP + --enable-aiter / SGLANG_USE_AITER=1). On any other platform / backend
 # the SHUFFLE 5D pool layout has no consumer kernels, so the env var is
@@ -4830,6 +4842,16 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
+        # Ampere (SM80/SM86) has no native FP8 arithmetic.  Keep the raw
+        # byte-backed cache facade used by the paged allocators, but store
+        # unquantized BF16 index rows there on those devices.  Hopper and
+        # Blackwell retain the compact FP8+scale layout.
+        self.index_k_cache_is_fp8 = not (
+            _is_cuda and torch.cuda.get_device_capability()[0] < 9
+        )
+        self.index_k_storage_bytes_per_token = get_dsa_index_storage_bytes_per_token(
+            index_head_dim
+        )
         self.tail_extra_slots = tail_extra_slots
         self.slots_per_page = self.page_size
         if index_buf_size is None:
@@ -5075,6 +5097,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_k_scale: torch.Tensor,
     ) -> None:
         self.index_key_cache.store_quantized(layer_id, loc, index_k, index_k_scale)
+
+    def set_index_k_buffer(
+        self, layer_id: int, loc: torch.Tensor, index_k: torch.Tensor
+    ) -> None:
+        """Store unquantized BF16 index rows for Ampere fallback devices."""
+        if self.index_k_cache_is_fp8:
+            raise RuntimeError("set_index_k_buffer is only valid for BF16 index caches")
+        self.index_key_cache.set_bf16(layer_id, loc, index_k)
 
     def _get_compress_tail_cpu_copy(self, req_pool_index):
         if not self.kpool_use_compress or req_pool_index is None:

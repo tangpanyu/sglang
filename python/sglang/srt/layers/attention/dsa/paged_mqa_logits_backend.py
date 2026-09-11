@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from enum import Enum
 
+import torch
+
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_hip
 
@@ -10,6 +12,7 @@ class DSAPagedMQALogitsBackend(Enum):
     DEEPGEMM = "deepgemm"
     CUTEDSL = "cutedsl"
     AITER = "aiter"
+    TORCH = "torch"
 
     def is_deepgemm(self) -> bool:
         return self == DSAPagedMQALogitsBackend.DEEPGEMM
@@ -19,6 +22,9 @@ class DSAPagedMQALogitsBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == DSAPagedMQALogitsBackend.AITER
+
+    def is_torch(self) -> bool:
+        return self == DSAPagedMQALogitsBackend.TORCH
 
     @staticmethod
     def resolve(value: str) -> DSAPagedMQALogitsBackend:
@@ -30,7 +36,17 @@ class DSAPagedMQALogitsBackend(Enum):
                 )
             return DSAPagedMQALogitsBackend.AITER
 
-        if value == "auto" or value == "deepgemm":
+        if value == "auto":
+            # DeepGEMM's CUDA paged-MQA kernels start at SM90.  Keep the
+            # explicit ``deepgemm`` option strict, while making auto usable
+            # on SM80/SM86 fallback machines.
+            if not torch.cuda.is_available():
+                return DSAPagedMQALogitsBackend.DEEPGEMM
+            major, _ = torch.cuda.get_device_capability()
+            if major < 9:
+                return DSAPagedMQALogitsBackend.TORCH
+            return DSAPagedMQALogitsBackend.DEEPGEMM
+        if value == "deepgemm":
             return DSAPagedMQALogitsBackend.DEEPGEMM
         if value == "aiter":
             raise ValueError("dsa_paged_mqa_logits_backend='aiter' requires ROCm.")
@@ -40,4 +56,6 @@ class DSAPagedMQALogitsBackend(Enum):
                     "dsa_paged_mqa_logits_backend='cutedsl' requires SM100 (Blackwell)."
                 )
             return DSAPagedMQALogitsBackend.CUTEDSL
+        if value == "torch":
+            return DSAPagedMQALogitsBackend.TORCH
         raise ValueError(f"Unknown dsa_paged_mqa_logits_backend: {value!r}")

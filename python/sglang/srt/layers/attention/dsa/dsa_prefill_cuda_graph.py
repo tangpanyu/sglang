@@ -165,7 +165,7 @@ def pcg_dsa_indexer_prefill_split(
         enable_dual_stream=False,
         forward_batch=forward_batch,
     )
-    q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
+    q_fp8, q_scale = indexer._prepare_index_query(query, act_quant)
     # Reuse the compiled head-gate util shared with the eager path.
     weights = indexer._get_logits_head_gate(x, q_scale)
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into

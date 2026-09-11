@@ -40,7 +40,9 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_dsv4_indexer_bytes_per_token,
     get_swa_ring_size,
 )
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    get_dsa_index_storage_bytes_per_token,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -463,12 +465,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
-        indexer_size_per_token = (
-            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
-        )
-        element_size = torch._utils._element_size(
-            DSATokenToKVPool.index_k_with_scale_buffer_dtype
-        )
+        indexer_size_per_token = get_dsa_index_storage_bytes_per_token(index_head_dim)
+        element_size = 1
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
@@ -585,12 +583,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             )
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                index_elements = (
+                self._full_per_token += get_dsa_index_storage_bytes_per_token(
                     index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
-                )
-                self._full_per_token += index_elements * torch._utils._element_size(
-                    DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
             self._swa_per_token = (
                 model_config.swa_kv_lora_rank + model_config.swa_qk_rope_head_dim

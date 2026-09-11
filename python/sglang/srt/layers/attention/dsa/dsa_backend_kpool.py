@@ -42,6 +42,10 @@ class DeepseekSparseAttnBackendKPoolMixin:
             topk_indices is None
             or self.dsa_index_kpool <= 1
             or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or (
+                dsa_impl == "flashinfer_sparse_mla"
+                and getattr(self, "model_arch", None) == "Glm5FlashTinyForCausalLM"
+            )
         ):
             return
         raise NotImplementedError(
@@ -71,6 +75,11 @@ class DeepseekSparseAttnBackendKPoolMixin:
         return getattr(self.token_to_kv_pool, "slots_per_page", self.real_page_size)
 
     def _build_kpool_paged_mqa_schedule_metadata(self) -> bool:
+        # The Torch paged-MQA fallback does not consume DeepGEMM's schedule
+        # tensor.  Avoid constructing it on SM80/SM86, where the index cache
+        # and logits path are BF16 rather than DeepGEMM FP8.
+        if self.dsa_paged_mqa_logits_backend.is_torch():
+            return False
         if self.device_sm_major == 9:
             return self.num_q_heads in (32, 64)
         return True

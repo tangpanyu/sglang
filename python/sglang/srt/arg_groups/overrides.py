@@ -506,6 +506,7 @@ def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
 # guards in _handle_model_specific_adjustments.
 _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
+        "Glm5FlashTinyForCausalLM",
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
@@ -537,6 +538,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
 # The single source of truth; `supports_mamba_cache_extra_buffer` reads it.
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
+        "Glm5FlashTinyForCausalLM",
         "KimiLinearForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
@@ -746,7 +748,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     declared: Dict[str, Any] = {}
     model_arch = hf_config.architectures[0]
     is_glm_sm12_fp8 = (
-        model_arch == "GlmMoeDsaForCausalLM"
+        model_arch in ("GlmMoeDsaForCausalLM", "Glm5FlashTinyForCausalLM")
         and major == 12
         and kv_cache_dtype == "fp8_e4m3"
         and not get_platform().is_hip
@@ -814,7 +816,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     else:
         # Set prefill/decode backends based on hardware architecture.
         if not user_set_prefill:
-            declared["dsa_prefill_backend"] = "flashmla_sparse"
+            # FA3 is the portable BF16 sparse-MQA path on Ampere; the native
+            # FlashMLA sparse kernel starts at Hopper.
+            declared["dsa_prefill_backend"] = (
+                "fa3" if major < 9 else "flashmla_sparse"
+            )
         if not user_set_decode:
             declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
 
@@ -833,6 +839,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 # Keep in sync with the DeepSeek family list on _deepseek_family_overrides.
 _DEEPSEEK_FAMILY_ARCHS = frozenset(
     {
+        "Glm5FlashTinyForCausalLM",
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
         "KimiK25ForConditionalGeneration",

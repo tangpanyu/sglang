@@ -7,10 +7,24 @@ import triton.language as tl
 
 
 def transform_index_page_table_prefill(**kwargs):
+    # The fused Triton implementation is specialized for production DSA
+    # top-k=2048.  Tiny/reference models intentionally use a smaller top-k
+    # (currently 8); preserve the same token/page semantics with the eager
+    # gather fallback instead of rejecting the sparse layout.
+    topk_indices = kwargs.get("topk_indices")
+    if topk_indices is not None and topk_indices.shape[1] != 2048:
+        ref_kwargs = dict(kwargs)
+        # The reference implementation reconstructs request rows from
+        # extend_lens_cpu and does not consume the fused kernel's cu-seqlens.
+        ref_kwargs.pop("cu_seqlens_q", None)
+        return transform_index_page_table_prefill_ref(**ref_kwargs)
     return transform_index_page_table_prefill_fast(**kwargs)
 
 
 def transform_index_page_table_decode(**kwargs):
+    topk_indices = kwargs.get("topk_indices")
+    if topk_indices is not None and topk_indices.shape[1] != 2048:
+        return transform_index_page_table_decode_ref(**kwargs)
     return transform_index_page_table_decode_fast(**kwargs)
 
 

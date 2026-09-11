@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     kpool_assemble_softmax_rotate_write_cache,
     kpool_max_closed_pools,
     kpool_write_tail_and_maybe_compress,
+    topk_from_pooled_history_logits,
     update_kpool_write_plan_cuda_graph,
 )
 from sglang.srt.layers.attention.dsa.kpool_plan import (
@@ -41,6 +42,35 @@ class TestDsaKpoolMultiPool(CustomTestCase):
     def _empty_cache(self) -> torch.Tensor:
         page_nbytes = self.SLOTS_PER_PAGE * INDEX_HEAD_DIM + self.SLOTS_PER_PAGE * 4
         return torch.zeros((1, page_nbytes), dtype=torch.uint8, device="cuda")
+
+    def test_small_group_topk_uses_torch_fallback(self):
+        logits = torch.tensor(
+            [
+                [0.0, 9.0, 2.0, 8.0, 1.0, -9.0],
+                [5.0, 1.0, 4.0, -9.0, -9.0, -9.0],
+            ],
+            dtype=torch.float32,
+            device="cuda",
+        )
+        pool_lens = torch.tensor([5, 3], dtype=torch.int32, device="cuda")
+        seq_lens = torch.tensor([22, 13], dtype=torch.int32, device="cuda")
+
+        actual = topk_from_pooled_history_logits(
+            logits,
+            pool_lens,
+            pool_size=self.POOL_SIZE,
+            topk=8,
+            seq_lens=seq_lens,
+        )
+        expected = torch.tensor(
+            [
+                [4, 5, 6, 7, 12, 13, 14, 15, 20, 21, -1],
+                [0, 1, 2, 3, 8, 9, 10, 11, 12, -1, -1],
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        torch.testing.assert_close(actual, expected)
 
     def test_write_plan_records_every_candidate_pool(self):
         batch_size = 2

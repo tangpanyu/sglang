@@ -65,6 +65,9 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
+)
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
@@ -338,6 +341,7 @@ class DeepseekSparseAttnBackend(
             1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
         hf_config = model_runner.model_config.hf_config
+        self.model_arch = hf_config.architectures[0]
         self.use_dsa = is_deepseek_dsa(hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
         self.dsa_kv_cache_store_fp8 = (
@@ -365,6 +369,9 @@ class DeepseekSparseAttnBackend(
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        self.dsa_paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            get_exec().kernel.dsa_paged_mqa_logits_backend
+        )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
@@ -743,6 +750,8 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
+        if self.dsa_paged_mqa_logits_backend.is_torch():
+            return
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32_2d, 64, deep_gemm.get_num_sms()
         )
@@ -1106,9 +1115,12 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            if not self.dsa_paged_mqa_logits_backend.is_torch():
+                paged_mqa_schedule_metadata = (
+                    deep_gemm.get_paged_mqa_logits_metadata(
+                        paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                    )
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -1457,9 +1469,12 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            if not self.dsa_paged_mqa_logits_backend.is_torch():
+                paged_mqa_schedule_metadata = (
+                    deep_gemm.get_paged_mqa_logits_metadata(
+                        paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                    )
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,

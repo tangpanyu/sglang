@@ -233,8 +233,8 @@ class ExecKernel:
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(
-            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
-            choices=["auto", "deepgemm", "cutedsl", "aiter"],
+            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; Torch on SM80/SM86, DeepGEMM on newer CUDA, aiter on ROCm), 'torch', 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM100 only), or 'aiter' (ROCm only).",
+            choices=["auto", "torch", "deepgemm", "cutedsl", "aiter"],
         ),
     ] = "auto"
     dsa_topk_backend: A[

@@ -33,8 +33,7 @@ class IndexKeyCache:
         pool = self.pool
         return (
             num_pages,
-            pool.page_size
-            * (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
+            pool.page_size * pool.index_k_storage_bytes_per_token,
         )
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
@@ -50,6 +49,15 @@ class IndexKeyCache:
             return
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        if not self.pool.index_k_cache_is_fp8:
+            for index_k in self.buffer:
+                if index_k.shape[0] == 0:
+                    continue
+                rows = index_k.view(torch.bfloat16).reshape(
+                    -1, self.pool.index_head_dim
+                )
+                rows[tgt_loc_flat] = rows[src_loc_flat]
+            return
         for index_k in self.buffer:
             if index_k.shape[0] == 0:
                 continue
@@ -67,6 +75,8 @@ class IndexKeyCache:
 
     def get_k_continuous(self, layer_id: int, seq_len: int, page_indices: torch.Tensor):
         buf = self.get_buffer(layer_id)
+        if not self.pool.index_k_cache_is_fp8:
+            return self._get_bf16_rows(buf, seq_len, page_indices)
         return index_buf_accessor.GetK.execute(
             self.pool, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -75,6 +85,8 @@ class IndexKeyCache:
         self, layer_id: int, seq_len: int, page_indices: torch.Tensor
     ):
         buf = self.get_buffer(layer_id)
+        if not self.pool.index_k_cache_is_fp8:
+            return torch.ones((seq_len,), dtype=torch.float32, device=buf.device)
         return index_buf_accessor.GetS.execute(
             self.pool, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -88,6 +100,25 @@ class IndexKeyCache:
         max_seq_len: int,
     ):
         buf = self.get_buffer(layer_id)
+        if not self.pool.index_k_cache_is_fp8:
+            rows = []
+            for row, seq_len in enumerate(seq_len_tensor.tolist()):
+                if seq_len > 0:
+                    rows.append(
+                        self._get_bf16_rows(buf, int(seq_len), page_indices[row])
+                    )
+            keys = (
+                torch.cat(rows, dim=0)
+                if rows
+                else torch.empty(
+                    (0, self.pool.index_head_dim),
+                    dtype=torch.bfloat16,
+                    device=buf.device,
+                )
+            )
+            return keys, torch.ones(
+                (keys.shape[0],), dtype=torch.float32, device=buf.device
+            )
         return index_buf_accessor.GetKAndS.execute(
             self.pool,
             buf,
@@ -97,6 +128,15 @@ class IndexKeyCache:
             max_seq_len=max_seq_len,
         )
 
+    def _get_bf16_rows(
+        self, buf: torch.Tensor, seq_len: int, page_indices: torch.Tensor
+    ) -> torch.Tensor:
+        pages = buf.view(torch.bfloat16).reshape(
+            -1, self.pool.page_size, self.pool.index_head_dim
+        )
+        page_indices = page_indices.reshape(-1).to(torch.long)
+        return pages[page_indices].reshape(-1, self.pool.index_head_dim)[:seq_len]
+
     def store_quantized(
         self,
         layer_id: int,
@@ -105,6 +145,9 @@ class IndexKeyCache:
         index_k_scale: torch.Tensor,
     ) -> None:
         buf = self.buffer[layer_id - self.pool.start_layer]
+        if not self.pool.index_k_cache_is_fp8:
+            self.set_bf16(layer_id, loc, index_k)
+            return
         index_buf_accessor.SetKAndS.execute(
             pool=self.pool,
             buf=buf,
@@ -112,6 +155,11 @@ class IndexKeyCache:
             index_k=index_k,
             index_k_scale=index_k_scale,
         )
+
+    def set_bf16(self, layer_id: int, loc: torch.Tensor, index_k: torch.Tensor) -> None:
+        buf = self.buffer[layer_id - self.pool.start_layer]
+        rows = buf.view(torch.bfloat16).reshape(-1, self.pool.index_head_dim)
+        rows[loc.to(torch.long)] = index_k.to(torch.bfloat16)
 
     def cpu_copy(self, indices):
         # Retracted pages may be reused before resume, so offload index-K with KV.

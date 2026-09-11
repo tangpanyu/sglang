@@ -63,13 +63,14 @@ class TinyGlm5Config:
     num_attention_heads: int = 4
     head_dim: int = 64
     q_lora_rank: int = 64
-    # SGLang's DSA FP8 MLA cache uses a 512-wide latent KV tile.
+    # GLM-5.3-Flash keeps a 512-wide latent KV tile in DSA.
     kv_lora_rank: int = 512
-    # SGLang's DSA FP8 cache has a fixed 512-wide non-rotary key tile.
+    # Keep the cache-facing DSA non-rotary key width used by the tiny adapter.
     qk_nope_head_dim: int = 512
-    # SGLang's DSA backend requires a non-empty rotary slice for its index
-    # cache; the tiny adapter keeps this cache-visible shape at 64.
-    qk_rope_head_dim: int = 64
+    # GLM-5.3-Flash DSA is a pure-nope MLA path: it has no rotary key/query
+    # slice.  The SGLang adapter must therefore run with the same zero-width
+    # rope dimension instead of manufacturing a cache-only 64-wide tail.
+    qk_rope_head_dim: int = 0
     v_head_dim: int = 64
 
     # KDA dimensions.  These are separate fields in the real configuration.
@@ -91,8 +92,11 @@ class TinyGlm5Config:
     index_topk: int = 8
     # Keep SGLang's DSA index-key width; only the number of heads is scaled.
     index_head_dim: int = 128
-    index_n_heads: int = 2
+    # DeepGEMM's paged-MQA indexer accepts 8/16/32/64 query heads; 8 is the
+    # smallest supported tiny shape while retaining the production indexer.
+    index_n_heads: int = 8
     index_kpool: int = 4
+    index_kpool_compress: bool = True
     index_kpool_always_select_tail: bool = True
 
     # Keep the four persistent mHC streams used by GLM-5.3-Flash.  Other
@@ -386,7 +390,10 @@ class TinyDSAIndexer(nn.Module):
         self.weights_proj = nn.Linear(
             config.hidden_size, self.index_n_heads, bias=False
         )
-        self.k_norm = RMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
+        # GLM-5.3-Flash's indexer checkpoint contains both k_norm.weight and
+        # k_norm.bias.  This is LayerNorm, unlike the RMSNorm used by the
+        # surrounding decoder blocks.
+        self.k_norm = nn.LayerNorm(self.index_head_dim, eps=config.rms_norm_eps)
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.index_kpool, self.index_head_dim)
         )
@@ -611,11 +618,8 @@ class TinyDSA(nn.Module):
         key, value = torch.split(
             expanded_kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
-        if self.qk_rope_head_dim:
-            # The compact reference does not materialize a separate rotary KV
-            # cache; keep the cache-visible DSA key width by appending a zero
-            # rotary slice (the SGLang adapter uses the real rotary cache).
-            key = F.pad(key, (0, self.qk_rope_head_dim))
+        # GLM-5.3-Flash has no rotary DSA slice.  Keep key/query widths equal
+        # to qk_nope_head_dim; the SGLang path uses the same no-RoPE layout.
 
         if self.indexer_type == "shared":
             if prev_topk_indices is None:

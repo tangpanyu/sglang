@@ -85,6 +85,15 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
             return
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        if not self.pool.index_k_cache_is_fp8:
+            for index_k in self.buffer:
+                if index_k.shape[0] == 0:
+                    continue
+                rows = index_k.view(torch.bfloat16).reshape(
+                    -1, self.pool.index_head_dim
+                )
+                rows[tgt_loc_flat] = rows[src_loc_flat]
+            return
         for index_k in self.buffer:
             if index_k.shape[0] != 0:
                 index_k[tgt_loc_flat] = index_k[src_loc_flat]
@@ -106,6 +115,25 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
     ):
         buf = self.get_buffer(layer_id)
         self.pool.prefetch_kv_buffer(layer_id)
+        if not self.pool.index_k_cache_is_fp8:
+            rows = []
+            for row, seq_len in enumerate(seq_len_tensor.tolist()):
+                if seq_len > 0:
+                    rows.append(
+                        self._get_bf16_rows(buf, int(seq_len), page_indices[row])
+                    )
+            keys = (
+                torch.cat(rows, dim=0)
+                if rows
+                else torch.empty(
+                    (0, self.pool.index_head_dim),
+                    dtype=torch.bfloat16,
+                    device=buf.device,
+                )
+            )
+            return keys, torch.ones(
+                (keys.shape[0],), dtype=torch.float32, device=buf.device
+            )
         return index_buf_accessor.GetKAndS.execute(
             self.pool,
             buf,
@@ -125,6 +153,13 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         self.invalidate(layer_id)
         if self.pool._is_layer_owned(layer_id):
             super().store_quantized(layer_id, loc, index_k, index_k_scale)
+
+    def set_bf16(
+        self, layer_id: int, loc: torch.Tensor, index_k: torch.Tensor
+    ) -> None:
+        self.invalidate(layer_id)
+        if self.pool._is_layer_owned(layer_id):
+            super().set_bf16(layer_id, loc, index_k)
 
     def invalidate(self, layer_id: int) -> None:
         if self.remote_layer_id == layer_id:

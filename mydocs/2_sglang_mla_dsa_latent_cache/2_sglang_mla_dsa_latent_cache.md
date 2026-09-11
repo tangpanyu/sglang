@@ -2,13 +2,13 @@
 
 > 本文从零解释 DSA，不假设你读过 DSA 论文、DeepSeek-DSA 实现或 SGLang 的其他缓存文档。先回答“DSA 在计算上做了什么”，再回答“这些中间结果为什么要这样存”，最后才进入 SGLang 的 pool、allocator、metadata 和 backend。
 >
-> **源码基线与主线条件**：按当前 checkout `a478b5d7e74d83a9bcdb31440c2ffd64b01a2d66`（2026-09-08 核对）阅读；主线固定 CUDA、decoder-only、eager、普通 DSA/MLA pool（main KV 为 BF16），先忽略 DCP/CP、speculative decoding、HiCache、具体量化后端和 CUDA graph。为让第 5 节的 `self.wk`、`self.weights_proj` 非融合摘录与实际代码一致，可在实验进程设置 `SGLANG_DISABLE_DSA_INDEXER_FUSION=1`；未设置时默认 CUDA 可能走融合路径，正文会明确标注哪些片段只适用于非融合分支。
+> **源码基线与主线条件**：2026-09-10 按当前 `main` checkout `4c514fd0b` 及当前工作区的 GLM-5.3-Flash tiny/KPool 适配核对。本文主线仍固定 CUDA、decoder-only、eager、普通逐 token DSA/MLA pool（main KV 为 BF16），先忽略 DCP/CP、speculative decoding、HiCache、具体量化后端和 CUDA graph。GLM-5.3-Flash 使用的 KPool DSA 会改变 index sidecar 的粒度和生命周期，不能套用所有“每 token 一个 index key”的结论；该变体在第 10.2 节单独收口，完整 tiny 主线见 [4.1｜Tiny GLM-5.3-Flash](../4_1_tiny_glm5_flash_sglang/4_1_tiny_glm5_flash_sglang.md)。为让第 5 节的 `self.wk`、`self.weights_proj` 非融合摘录与实际代码一致，可在实验进程设置 `SGLANG_DISABLE_DSA_INDEXER_FUSION=1`；未设置时默认 CUDA 可能走融合路径。
 
 ## 0. 这篇只回答一个问题
 
 **DSA 为什么能少读昂贵的主 KV payload，以及 SGLang 怎样保存它需要的两类历史数据？**
 
-先把整条计算链放在眼前：
+先把普通逐 token DSA 的整条计算链放在眼前。下图不包含 GLM KPool 的组内压缩和 tail，那两个节点在第 10.2 节落到代码：
 
 ```mermaid
 flowchart LR
@@ -31,7 +31,7 @@ flowchart LR
 1. **Indexer**：用便宜的 `qI` 和历史 `kI` 选出候选位置；
 2. **Formal attention**：只对候选位置读取真正的 MLA 主 KV，再做正式 attention。
 
-这就是 Sparse Attention 的“稀疏”来源：formal 阶段仍使用 logits、softmax 和 value aggregation 的 attention 形式，但只在筛选出的子集上计算。由于非候选 token 被丢弃，它一般不与 dense attention 数值完全相等；模型训练/设计让这个近似在质量与成本之间可接受。注意，Indexer 仍然要扫描全历史的紧凑 `kI`；省下来的主要是主 KV 的带宽和 formal attention 的计算。
+这就是 Sparse Attention 的“稀疏”来源：formal 阶段仍使用 logits、softmax 和 value aggregation 的 attention 形式，但只在筛选出的子集上计算。由于非候选 token 被丢弃，它一般不与 dense attention 数值完全相等；模型训练/设计让这个近似在质量与成本之间可接受。本文的普通 DSA 主线中，Indexer 仍然要扫描全历史的紧凑 `kI`；GLM KPool 变体则扫描每 4 个 token 压缩出的 pooled `kI`。两者都省下主 KV 带宽和 formal attention 计算，KPool 还进一步降低了 indexer 本身的历史扫描长度。
 
 ### 0.1 本文的前置假设
 
@@ -53,6 +53,7 @@ layer split，普通 CUDA pool 使用 `page_size=64`、`index_head_dim=128`；�
 |---|---|---|
 | DSA | DeepSeek Sparse Attention：先索引筛选、再正式 attention | 不是一种 allocator |
 | Indexer | 计算历史 token 的 index score 并产生 top-k 的小模块 | 不是正式 attention kernel |
+| KPool | GLM 路径中把连续 index key 压缩后按 group 检索的逻辑分组 | 不是 `TokenToKVPool`，也不是新的 page allocator |
 | KV cache | 把已经算过的历史 K/V 或等价表示保存起来，后续直接读取 | 不是 top-k 结果本身 |
 
 本文的阅读顺序固定为：**先用 dense attention 说明要优化什么 → 用一段小代码跑通 DSA → 解释为什么出现 main/sidecar 两份历史数据 → 再引入 `loc`、pool、metadata 和初始化调用链**。后面的章节不会把后面的运行时对象倒灌回前面的公式。
@@ -400,9 +401,9 @@ if self.q_lora_rank is not None:
 | 教学变量 | SGLang 里先看哪里 | 该结果接下来被谁消费 |
 |---|---|---|
 | `q_lora` | [`forward_absorb_prepare`](../../python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py#279-670) | `Indexer.forward_cuda` 的 query 投影 |
-| `qI` / `kI` | [`Indexer._get_q_k_bf16`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#462-568) | FP8 MQA logits kernel |
-| `gate` | [`_get_logits_head_gate`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#367-373) | FP8 logits 的 head 权重 |
-| `index_score` / `topk` | [`_get_topk_ragged`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1035-1238) 或 [`_get_topk_paged`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#794-975) | `topk_transform`，再交给 sparse MLA |
+| `qI` / `kI` | [`Indexer._get_q_k_bf16`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#484-570) | FP8/BF16 MQA logits kernel |
+| `gate` | [`_get_logits_head_gate`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#380-386) | FP8/BF16 logits 的 head 权重 |
+| `index_score` / `topk` | [`_get_topk_ragged`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1146-1375) 或 [`_get_topk_paged`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#796-1060) | `topk_transform`，再交给 sparse MLA |
 
 源码会把若干步骤融合进 CUDA/FP8 kernel，所以函数名不一定逐字出现 `index_score`。先用这张表确认“谁生产、谁消费”，再读 kernel 内部优化。
 
@@ -495,11 +496,12 @@ attention probability，不能把 indexer 的分数直接当成 `weights`。
 
 如果 indexer 每次都从较大的 `[c_KV | k_R]` 中构造筛选所需的表示，会让“扫描全部历史”也搬运正式 attention 的 payload。sidecar 让 indexer 只读取较小的 `kI_fp8 + scale`。
 
-以常见参数作容量直觉（不是所有模型恒定值）：
+以本文普通逐 token DSA 主线的常见参数作容量直觉（不是所有模型恒定值，也不是 GLM KPool 的 allocator 结论）：
 
 - BF16 main：`(512 + 64) × 2 = 1152` bytes/token/layer；
-- DSA sidecar：`128 + 4 = 132` bytes/token/layer；
-- sidecar 大约是 main payload 的 11.5%。
+- DSA sidecar：新架构的 FP8+scale 紧凑布局是 `128 + 4 = 132` bytes/token/layer；
+- Ampere（SM80/SM86）不使用 FP8 index cache，而按 BF16 行保存，物理 stride 是 `128 × 2 = 256` bytes/token/layer；
+- 因此 11.5% 只适用于新架构的 FP8 sidecar，不能拿来估算 Ampere 的 BF16 sidecar。
 
 ## 4. 先固定一条真实实现主线
 
@@ -512,8 +514,10 @@ attention probability，不能把 indexer 的分数直接当成 `weights`。
 
 ![DSA eager forward 的 metadata、sidecar、top-k 与 main cache 生命周期](assets/mla_dsa_lifecycle.svg)
 
+这张图仍是普通逐 token DSA 的生命周期锚点；GLM KPool 在 sidecar 写入前还有“request tail → 凑满 group → pooled key”状态转移，且 Indexer 读取 pooled page table，这些差异见第 10.2 节，不应强行画进这张通用图。
+
 读图时沿着 0→4 走：调度/分配先补好 `req_to_token` 和 `out_cache_loc`，eager runner 的
-[`init_forward_metadata`](../../python/sglang/srt/layers/attention/dsa_backend.py#777-1075) 再构造页表与序列边界；层内准备把 `q_lora`、`k_nope`、`k_pe` 交给
+[`init_forward_metadata`](../../python/sglang/srt/layers/attention/dsa_backend.py#850-1160) 再构造页表与序列边界；层内准备把 `q_lora`、`k_nope`、`k_pe` 交给
 Indexer，Indexer 用同一批写地址保存 sidecar 并产生候选，最后 attention backend 写 main
 latent cache 并按候选读取。图中箭头表示数据就绪依赖，不表示 CUDA stream 一定串行；`skip_topk`
 层的 0-row sidecar 占位和上一层 top-k 复用属于后续边界，不要把它误读成第二套地址映射。
@@ -587,7 +591,7 @@ query = self._maybe_rotate(query)
 key = self._maybe_rotate(key)
 ```
 
-源码入口：[`Indexer._get_q_k_bf16`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#462-568)。
+源码入口：[`Indexer._get_q_k_bf16`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#484-570)。
 
 这段代码对应理论里的 `qI`、`kI`，但还没有进入 cache：query 要被量化后参与 logits，key
 要被量化后写入 sidecar。RoPE 只作用于相应切片；它不是把 latent 和 RoPE “相加”，而是
@@ -624,7 +628,7 @@ else:
 return maybe_capture_indexer_topk(layer_id, topk_result)
 ```
 
-源码入口：[`Indexer.forward_cuda`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1580-1920)。下方 `self.wk`/`self.weights_proj` 片段只对应设置 `SGLANG_DISABLE_DSA_INDEXER_FUSION=1` 的非融合路径；默认 CUDA 融合时应改看 `_fused_k_weights` 与 `_scale_head_gates`。
+源码入口：[`Indexer.forward_cuda`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1585-1855)。下方 `self.wk`/`self.weights_proj` 片段只对应设置 `SGLANG_DISABLE_DSA_INDEXER_FUSION=1` 的非融合路径；默认 CUDA 融合时应改看 `_fused_k_weights` 与 `_scale_head_gates`。
 
 这里发生了两个不同的状态变化：
 
@@ -649,23 +653,26 @@ if out_cache_loc is None:
 
 pool = get_token_to_kv_pool()
 ...
-k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
-pool.set_index_k_scale_buffer(
-    layer_id=layer_id,
-    loc=out_cache_loc,
-    index_k=k_fp8,
-    index_k_scale=k_scale,
-)
+if pool.index_k_cache_is_fp8:
+    k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+    pool.set_index_k_scale_buffer(
+        layer_id=layer_id,
+        loc=out_cache_loc,
+        index_k=k_fp8,
+        index_k_scale=k_scale,
+    )
+else:
+    pool.set_index_k_buffer(layer_id, out_cache_loc, key)
 ```
 
-写入入口：[`_store_index_k_cache`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1480-1560)；上面的代码只展示它的非融合 fallback，当前函数还含 CUDA fused store 和 AITER 分支。pool 接口：[`set_index_k_scale_buffer`](../../python/sglang/srt/mem_cache/memory_pool.py#4541-4548)。
+写入入口：[`_store_index_k_cache`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1474-1545)；上面的代码只展示它的非融合 fallback，当前函数还含 CUDA fused store、BF16 store 和 AITER 分支。pool 接口：[`set_index_k_scale_buffer`](../../python/sglang/srt/mem_cache/memory_pool.py#5092-5099) 与 Ampere 的 [`set_index_k_buffer`](../../python/sglang/srt/mem_cache/memory_pool.py#5101-5107)。
 
 因此这里的 producer/owner/consumer 是：
 
 | 状态 | producer | owner/carrier | consumer |
 |---|---|---|---|
 | 当前 `key` | `_get_q_k_bf16` | `Indexer.forward_cuda` 临时张量 | `act_quant` / store |
-| `kI_fp8 + scale` | `_store_index_k_cache` | `DSATokenToKVPool.index_key_cache` | `_get_topk_paged/ragged` |
+| `kI_fp8 + scale`（新架构）或 `kI_bf16`（SM80/SM86） | `_store_index_k_cache` | `DSATokenToKVPool.index_key_cache` | `_get_topk_paged/ragged` |
 | `topk_result` | top-k transform/kernel | `forward_absorb_prepare` 返回值 | `attn_mqa` |
 
 ## 6. `loc`、pool 和 metadata：计算路径使用的持久状态
@@ -793,7 +800,7 @@ self._write_mla_kv_buffer(
 )
 ```
 
-主 cache 写入：[`set_mla_kv_buffer`](../../python/sglang/srt/mem_cache/memory_pool.py#4188-4214)。
+主 cache 写入：[`set_mla_kv_buffer`](../../python/sglang/srt/mem_cache/memory_pool.py#4741-4793)。
 
 `DSATokenToKVPool` 在父类 main pool 之外创建 `index_key_cache`，并限制普通 CUDA 路径的
 `index_head_dim == 128`、物理 `page_size == 64`。这两项是当前实现条件，不是 DSA 理论的
@@ -807,7 +814,7 @@ assert self.page_size == 64
 self.index_key_cache = self._create_index_key_cache()
 ```
 
-DSA pool 定义：[`DSATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#4421-4567)。
+DSA pool 定义：[`DSATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#4796-5107)。
 
 ## 7. formal MLA：top-k 如何变成真正的 cache 读取
 
@@ -856,7 +863,7 @@ if k is not None:
         )
 ```
 
-真实路径：[`forward_extend`](../../python/sglang/srt/layers/attention/dsa_backend.py#1874-2182) 与 [`forward_decode`](../../python/sglang/srt/layers/attention/dsa_backend.py#2184-2352)。
+真实路径：[`forward_extend`](../../python/sglang/srt/layers/attention/dsa_backend.py#1981-2320) 与 [`forward_decode`](../../python/sglang/srt/layers/attention/dsa_backend.py#2323-2490)。
 
 此时同一个 `loc` 上已经有两类 payload：Indexer 写入的 `kI_fp8 + scale`，以及 backend
 写入的 `[c_KV | k_R]`。下一步不是再次计算 index score，而是把 `topk_indices` 变成主 KV
@@ -937,10 +944,10 @@ flattened buffer 的 `(ks, ke)` 范围（`ks` 随请求累计，`ke` 再加该 t
 不应解读成单个请求的一对“历史起点/终点”。这些表示差异不改变“逻辑候选需要被转换成
 kernel 可读坐标”的契约。
 
-producer/consumer 可以这样记：[`init_forward_metadata`](../../python/sglang/srt/layers/attention/dsa_backend.py#777-1075)
+producer/consumer 可以这样记：[`init_forward_metadata`](../../python/sglang/srt/layers/attention/dsa_backend.py#850-1160)
 产生这些字段，Indexer 用 page table 和序列边界读 sidecar，backend 再用
 `topk_indices_offset` 或 `transform_index_page_table_*` 把候选路由交给 sparse MLA。字段
-定义见 [`DSAMetadata`](../../python/sglang/srt/layers/attention/dsa_backend.py#193-254)。
+定义见 [`DSAMetadata`](../../python/sglang/srt/layers/attention/dsa_backend.py#209-298)。
 
 ## 8. 地址生命周期：复用、迁移和释放
 
@@ -967,7 +974,7 @@ def move_kv_cache(self, tgt_loc, src_loc):
     self.index_key_cache.move(tgt_loc, src_loc)
 ```
 
-源码入口：[`DSATokenToKVPool.move_kv_cache`](../../python/sglang/srt/mem_cache/memory_pool.py#4503-4506)。
+源码入口：[`DSATokenToKVPool.move_kv_cache`](../../python/sglang/srt/mem_cache/memory_pool.py#5054-5057)。
 
 如果只移动 main，新地址的 `[c_KV | k_R]` 会和旧地址的 `kI` 错配；下一次 Indexer 筛选出
 来的候选就不再对应正确 token。这是“同一 `loc` 契约”在生命周期阶段的具体后果。
@@ -984,11 +991,12 @@ allocator 释放 `loc/page` 后，下一次分配可能复用同一地址；生�
 
 1. 读本文第 1～3 节，确认 `qI/kI/gate/top-k` 和两类 payload 的理论契约；
 2. 看 [`forward_absorb_prepare`](../../python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py#279-670)，确认 `hidden_states/q_lora → Indexer`；
-3. 看 [`Indexer._get_q_k_bf16`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#462-568)，确认 query/key、norm、RoPE；
-4. 看 [`Indexer.forward_cuda`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1580-1920)，确认量化、sidecar 写入和 top-k；
-5. 看 [`DSATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#4421-4567)，确认两个 payload 如何共享 `loc`；
-6. 看 [`dsa_backend.forward_extend`](../../python/sglang/srt/layers/attention/dsa_backend.py#1874-2182) / [`forward_decode`](../../python/sglang/srt/layers/attention/dsa_backend.py#2184-2352)，确认 main 写入、坐标转换和 sparse read；
-7. 最后回看 [`ModelRunner.alloc_memory_pool`](../../python/sglang/srt/model_executor/model_runner.py#881-903) 和 [`KVCacheConfigurator._build_dsa_kv_pool`](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1489-1540)，理解这些 owner 如何被创建。
+3. 看 [`Indexer._get_q_k_bf16`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#484-570)，确认 query/key、norm、RoPE；
+4. 看 [`Indexer.forward_cuda`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#1585-1855)，确认量化、sidecar 写入和 top-k；
+   若配置的 `index_kpool>1`，不要继续沿逐 token `Indexer` 推导，改走 [`IndexerKPool.forward_cuda`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py#1612-1781) 和本文第 10.2 节；
+5. 看 [`DSATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#4796-5107)，确认两个 payload 如何共享 `loc`；
+6. 看 [`dsa_backend.forward_extend`](../../python/sglang/srt/layers/attention/dsa_backend.py#1981-2320) / [`forward_decode`](../../python/sglang/srt/layers/attention/dsa_backend.py#2323-2490)，确认 main 写入、坐标转换和 sparse read；
+7. 最后回看 [`ModelRunner.alloc_memory_pool`](../../python/sglang/srt/model_executor/model_runner.py#889-920) 和 [`KVCacheConfigurator._build_dsa_kv_pool`](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#1559-1620)，理解这些 owner 如何被创建。
 
 第二遍按现象反查字段：
 
@@ -996,6 +1004,8 @@ allocator 释放 `loc/page` 后，下一次分配可能复用同一地址；生�
 |---|---|---|
 | sidecar 没有当前 token | `ForwardBatch.out_cache_loc`、`_store_index_k_cache` | `DSATokenToKVPool.set_index_k_scale_buffer` |
 | top-k 数量或位置不对 | `DSAMetadata.indexer_seq_lens`、`topk_indices` | `_get_topk_paged/ragged` 与 `topk_transform` |
+| GLM 中 top-k 为什么按 4 个 token 一组 | `index_kpool/index_kpool_compress` | `IndexerKPool` 与 `topk_from_pooled_history_logits` |
+| KPool decode 到组边界后结果变了 | `_compress_tail_k/_compress_tail_score` | `kpool_decode_update_index_cache` |
 | main KV 和索引错位 | `loc` 是否被一起移动 | `DSATokenToKVPool.move_kv_cache` |
 | kernel 读不到候选页 | `page_table_1` 与物理 `page_size` | `transform_index_page_table_decode` |
 | pool 类型不对 | `use_mla_backend`、`is_dsa_model` | `KVCacheConfigurator._build_dsa_kv_pool` |
@@ -1004,9 +1014,92 @@ allocator 释放 `loc/page` 后，下一次分配可能复用同一地址；生�
 
 ### 10.1 一个容易误判的优化：历史不超过 `index_topk`
 
-当可见历史长度 $S\le k$ 时，top-k 的结果本来就是全部有效位置，Indexer 计算完整 logits 再排序没有信息收益。源码的 [`Indexer._should_skip_logits_computation`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#395-460) 会在支持的路径走 “k-only” 快路径：仍然写入需要的 `kI`，但跳过这次 logits/top-k 计算。这个优化没有改变 DSA 的理论定义，只是利用了“候选数已经覆盖全部历史”这一边界条件。
+当可见历史长度 $S\le k$ 时，top-k 的结果本来就是全部有效位置，Indexer 计算完整 logits 再排序没有信息收益。源码的 [`Indexer._should_skip_logits_computation`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#407-472) 会在支持的路径走 “k-only” 快路径：仍然写入需要的 `kI`，但跳过这次 logits/top-k 计算。这个优化没有改变 DSA 的理论定义，只是利用了“候选数已经覆盖全部历史”这一边界条件。
 
-另外，配置为复用上一层 top-k 的层不会重新写 index-K；[`IndexKeyCache._layer_num_pages`](../../python/sglang/srt/mem_cache/index_key_cache.py#40-43) 会给这类层建立 0-row placeholder。读代码时把它看成“该层复用路由”的实现优化，不要误解成 sidecar 的地址契约消失了。
+另外，配置为复用上一层 top-k 的层不会重新写 index-K；[`IndexKeyCache._layer_num_pages`](../../python/sglang/srt/mem_cache/index_key_cache.py#39-43) 会给这类层建立 0-row placeholder。读代码时把它看成“该层复用路由”的实现优化，不要误解成 sidecar 的地址契约消失了。
+
+### 10.2 GLM-5.3-Flash：Indexer 从逐 token DSA 切换为 KPool DSA
+
+本节只补充 GLM 相对本文普通 DSA 主线改了什么；可运行的 tiny 数字例子、完整变量表和 PyTorch/SGLang 逐项对照见 [4.1 第 2.4 节](../4_1_tiny_glm5_flash_sglang/4_1_tiny_glm5_flash_sglang.md#157-278)。
+
+#### 创建入口：配置直接决定 Indexer 类
+
+[`DeepseekV2AttentionMLA.__init__`](../../python/sglang/srt/models/deepseek_v2.py#1814-1840) 不会把所有 DSA 都当作 KPool，而是按 `index_kpool` 分流：
+
+~~~python
+indexer_cls = IndexerKPool if get_dsa_index_kpool(config) > 1 else Indexer
+~~~
+
+普通 DSA 的 `Indexer` 给每个历史 token 保存一个 $k_i^I$、对 token score 做 top-k。GLM-5.3-Flash 的 `index_kpool=4`会选择 `IndexerKPool`：它先用新增的 `index_kpool_compress_gate` 和 `index_kpool_compress_ape` 把连续四个 key 压成一个 pooled key，再对 pool score 做 top-k。GLM 还以 `skip_rope=True` 构造 DSA 注意力，所以该路径不能套用本文普通示例中 $qk\_rope\_head\_dim=64$ 的图示数字。模型构造参见 [`Glm5NextDecoderLayer`](../../python/sglang/srt/models/glm5_next.py#580-612)。
+
+还有一个容易被外围 decoder 结构带偏的点：KPool Indexer 的 [`k_norm`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py#152-165) 是带 weight、bias 的 LayerNorm，不是 RMSNorm。tiny PyTorch reference 也按相同定义构造；两边不同的是 SGLang 将归一化参数和累积保持为 FP32，并在后续按 GPU 选择 Hadamard+FP8 或 Hadamard+BF16 serving 路径。
+
+#### 计算契约：分数主体保留，候选从 token 换成 group
+
+设 $P=\text{index\_kpool}$，组内学习式压缩可写为：
+
+$$
+\alpha_{p,r,d}
+=
+\operatorname{softmax}_{r}(g_{p,r,d}+a_{r,d}),
+\qquad
+\bar{k}_{p,d}
+=
+\sum_{r=0}^{P-1}\alpha_{p,r,d}k_{p,r,d}.
+$$
+
+Query 仍使用多个 index heads 和 head gate 为候选打分，只是 $k_i^I$ 替换成 $\bar{k}_p^I$：
+
+$$
+s_{t,p}
+=
+\sum_h w_{t,h}
+\operatorname{ReLU}
+\left(\frac{q^I_{t,h}\cdot\bar{k}^I_p}{\sqrt{D_I}}\right).
+$$
+
+因此它不是随机选择，而是在学习到的 pool score 上确定性地排序。选择的 group 数是：
+
+$$
+K_{\text{group}}
+=
+\frac{\text{index\_topk}}{\text{index\_kpool}}.
+$$
+
+[`topk_from_pooled_history_logits()`](../../python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py#537-655) 先算这个 `group_topk`，[`expand_pooled_groups_to_topk()`](../../python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py#359-380) 再把每个选中 group 展开回 $P$ 个原始 token 位置。正式 sparse MLA 始终消费原始 token 的 main latent KV，不消费 pooled key。
+
+#### 持久状态：完整 pool 进 sidecar，未完整 pool 进 request tail
+
+这个分支多出了跨 decode 轮次的 tail 状态，可以先用下面的教学等价伪代码闭环理解：
+
+~~~text
+# 教学等价伪代码，不是 SGLang API。
+state = {pooled_sidecar: [], tail: []}           # owner: DSATokenToKVPool
+for token in sequence:
+    key, compress_gate = make_index_state(token)
+    state.tail.append((key, compress_gate))      # 新 state
+    if len(state.tail) == index_kpool:
+        state.pooled_sidecar.append(compress(state.tail))
+        state.tail.clear()
+
+    groups = topk(score(query, state.pooled_sidecar), index_topk / index_kpool)
+    raw_positions = expand(groups) + visible_tail_positions(state.tail)
+    output = formal_mla(main[raw_positions])     # 消费 main，不消费 pooled key
+~~~
+
+真实 owner 是 [`DSATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#4796-5107)：完整 group 压缩后写入 `index_key_cache`，不满 $P$ 个 token 的 key/gate 则写入每请求、每层的 `_compress_tail_k/_compress_tail_score`。Decode 中的写入交给 [`kpool_decode_update_index_cache()`](../../python/sglang/srt/mem_cache/memory_pool.py#4987-5023)，下一轮凑满 group 时再压缩进 sidecar。
+
+#### page 只提供物理位置，不是 KPool 本身
+
+当前 CUDA KPool 路径要求 `page_size=64` 且 `64 % index_kpool == 0`，检查位于 [`IndexerKPool.__init__`](../../python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py#92-108)。`index_kpool=4` 时，一个 64-token main page 正好包含 16 个逻辑 group。[`build_pooled_page_table_64()`](../../python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py#16-28) 从 `real_page_table` 派生 pooled page table，没有创建第二套 allocator。
+
+也不能把本文第 3 节的普通 DSA `132 bytes/token/layer` 直接除以 4 当成当前 GPU 分配量。[`IndexKeyCache`](../../python/sglang/srt/mem_cache/index_key_cache.py#13-28) 仍按与 token allocator 耦合的 page-id 空间建立 buffer；KPool 降低的是有效 index 写入/扫描数和 kernel 计算量，不能只按逻辑 group 数推导实际 allocator 占用。
+
+#### 短序列与 tiny kernel 边界
+
+KPool 输出最多包含 `index_topk` 个由完整 groups 展开得到的 token 位置，再追加 $P-1$ 个 tail 位置，因此当可见长度 $L\le \text{index\_topk}+P-1$ 时仍是全选。GLM 生产值 `2048/4` 对应 `group_topk=512`；tiny 的 `8/4` 对应 `group_topk=2`。当前实现对 `128/160/192/224/256/512/2048` 保留编译快路径，对 2 这类小 bucket 则调用 `DSATopKBackend.TORCH.topk_func`。因此短上下文 all-visible smoke 本身仍不能证明 score top-k；要用 $L\ge12$ 的 tiny 上下文，当前已用 $L=68$ 的两页 SGLang smoke 和小 bucket 单测覆盖该分支。详细验收边界见 [4.1 第 8 节](../4_1_tiny_glm5_flash_sglang/4_1_tiny_glm5_flash_sglang.md#510-534)。
+
+### 10.3 其他未展开分支
 
 以下分支会改变实现细节，但不改变本文的 DSA 因果链：
 
@@ -1030,5 +1123,7 @@ allocator 释放 `loc/page` 后，下一次分配可能复用同一地址；生�
 7. `DSAMetadata` 为什么不是 KV cache 本身？
 8. 为什么 `move_kv_cache()` 必须同时移动 main 和 sidecar？
 9. `build_kv_cache()` 创建的是 payload，还是 prefix → loc 的 tree metadata？
+10. `index_kpool=4`、`index_topk=2048` 为什么实际做的是 512 个 group top-k？
+11. KPool 的 pooled key、incomplete tail 和 main latent KV 分别由谁持有、由谁消费？
 
 如果第 1～4 题还答不出来，不要继续抠 SGLang 类名；先回到第 1～2 节，把 DSA 的计算链跑通。只有当“为什么需要两种 payload”清楚之后，SGLang 的 pool 代码才有落点。

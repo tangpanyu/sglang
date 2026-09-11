@@ -77,11 +77,11 @@ class DSAIndexerPoolHost(HostKVCache):
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
+        # The device pool exposes the physical byte stride so host offload
+        # remains layout-compatible with Ampere's BF16 index cache as well as
+        # Hopper/Blackwell's FP8+scale cache.
         self.indexer_dtype = DSATokenToKVPool.index_k_with_scale_buffer_dtype
-        self.indexer_size_per_token = (
-            self.index_head_dim
-            + self.index_head_dim // self.indexer_quant_block_size * 4
-        )
+        self.indexer_size_per_token = device_pool.index_k_storage_bytes_per_token
         self.size = anchor_host.size
         self.page_num = anchor_host.page_num
 

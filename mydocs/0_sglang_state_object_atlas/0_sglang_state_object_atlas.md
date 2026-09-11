@@ -336,11 +336,11 @@ A 的 row 恰好等于 page 3 只是示例巧合。row、page ID、flat loc 和 
 
 ### 5.1 MLA
 
-普通 MLA 不再把每层 K/V 展开成所有 head，而是由 [MLATokenToKVPool](../../python/sglang/srt/mem_cache/memory_pool.py#L3970-L4078) 保存 compressed latent 和 RoPE 分量，常见行形状近似 `[T + P, 1, r + s]`。这里 `T` 是 pool capacity，`P` 是 page size，`r`、`s` 来自模型配置。先沿用“同一个 loc 找到本层持久数值”的心智模型；payload shape 和 getter 再去读第2篇。
+普通 MLA 不再把每层 K/V 展开成所有 head，而是由 [MLATokenToKVPool](../../python/sglang/srt/mem_cache/memory_pool.py#L4329-L4650) 保存 compressed latent 和 RoPE 分量，常见行形状近似 `[T + P, 1, r + s]`。这里 `T` 是 pool capacity，`P` 是 page size，`r`、`s` 来自模型配置。先沿用“同一个 loc 找到本层持久数值”的心智模型；payload shape 和 getter 再去读第2篇。
 
 ### 5.2 DSA
 
-[DSATokenToKVPool](../../python/sglang/srt/mem_cache/memory_pool.py#L4421-L4569) 在 MLA 主池旁增加 [IndexKeyCache](../../python/sglang/srt/mem_cache/index_key_cache.py#L14-L114)。主 latent、index K/scale 仍通过 loc 对齐，但 sidecar 是另一块物理存储；[Indexer](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#L1471-L1552) 生成本轮 score/top-k，[DSAMetadata](../../python/sglang/srt/layers/attention/dsa_backend.py#L193-L255) 携带 page/length/offset 等执行元数据，sparse backend 再消费这些结果。top-k 是 query-dependent 的执行结果，不是 prefix tree 永久保存的 token 列表。
+[DSATokenToKVPool](../../python/sglang/srt/mem_cache/memory_pool.py#L4796-L5574) 在 MLA 主池旁增加 [IndexKeyCache](../../python/sglang/srt/mem_cache/index_key_cache.py#L14-L183)。主 latent、index K/scale 仍通过 loc 对齐，但 sidecar 是另一块物理存储；[Indexer](../../python/sglang/srt/layers/attention/dsa/dsa_indexer.py#L1480-L1565) 生成本轮 score/top-k，[DSAMetadata](../../python/sglang/srt/layers/attention/dsa_backend.py#L209-L298) 携带 page/length/offset 等执行元数据，sparse backend 再消费这些结果。SM80/SM86 的 sidecar 按 BF16 行保存，SM90+ 才走 FP8+scale 紧凑布局。top-k 是 query-dependent 的执行结果，不是 prefix tree 永久保存的 token 列表。
 
 ### 5.3 Mamba / Linear Attention
 
@@ -377,7 +377,7 @@ mini 的 `Engine` 不是正式 SGLang 的 `TpModelWorker` 别名；它更像把�
 | prefix 命中后地址从哪来 | [Req.init_next_round_input → tree_cache.match_prefix](../../python/sglang/srt/managers/schedule_batch.py#L1390-L1495) | `alloc_for_extend` | 旧 prefix loc 和新 suffix loc 如何拼接 |
 | 本轮到底写哪 | [ScheduleBatch.prepare_for_extend](../../python/sglang/srt/managers/schedule_batch.py#L2504-L2585) | `ForwardBatch.init_new` → `ModelRunner.forward` | `out_cache_loc` 与 read table 的区别 |
 | 请求结束为什么不清空整个 pool | [UnifiedRadixCache finish](../../python/sglang/srt/mem_cache/unified_radix_cache.py#L838-L915) | [release_kv_cache](../../python/sglang/srt/mem_cache/common.py#L254-L296) | row、cached prefix、physical buffer 的释放边界 |
-| 碰到 MLA/DSA 名字 | [MLATokenToKVPool](../../python/sglang/srt/mem_cache/memory_pool.py#L3970-L4078) | `DSATokenToKVPool` → `IndexKeyCache` | 多的是 payload/sidecar/backend，不是新一套 row 语义 |
+| 碰到 MLA/DSA 名字 | [MLATokenToKVPool](../../python/sglang/srt/mem_cache/memory_pool.py#L4329-L4650) | `DSATokenToKVPool` → `IndexKeyCache` | 多的是 payload/sidecar/backend，不是新一套 row 语义 |
 
 ## 8. 容易误判的名字
 
@@ -406,3 +406,437 @@ mini 的 `Engine` 不是正式 SGLang 的 `TpModelWorker` 别名；它更像把�
 ![SGLang state ownership 总图（迷路时再看）](assets/sglang_state_ownership.svg)
 
 图只用于查“谁引用谁、谁保存什么”；阅读顺序仍以第 1 节的真实调用链为准。
+
+## 10. Chunked prefill：SGLang 到底按什么选择一次 forward
+
+> 本补充以当前工作区 main `862c483241c15211bc3456e005c693e8bcffe2a4` 为分析基线，主线仍是普通自回归 generation；dLLM、HiSparse、SWA/Mamba 等只在会改变预算或传输 payload 时点出。main 继续演进时，以链接中的函数名和字段关系为准。
+
+### 10.1 先给结论：不是一个 `max_extend_tokens`
+
+mini-SGLang 很容易给人一种印象：prefill 每轮只要做
+
+$$
+E = \min(\text{remaining prompt},\ \text{max\_extend\_tokens})
+$$
+
+然后把这 $E$ 个 token 交给一次 forward。正式 SGLang 的确也有一个“每轮最多延伸多少输入 token”的旋钮，但它只是 `PrefillAdder` 的一个预算。一次 admission 必须同时通过三类约束：
+
+| 预算 | 代码中的字段 | 它回答的问题 | 典型来源 |
+|---|---|---|---|
+| 输入预算 | `rem_input_tokens` | 这轮还能把多少新的 prompt token 放入 prefill batch？ | [`max_prefill_tokens`](../../python/sglang/srt/server_args.py#L728-L739) |
+| chunk 预算 | `rem_chunk_tokens` | 这一轮 prefill pass 还剩多少 extend token；单请求时就是它的上限 | `chunked_prefill_size`，或 PP dynamic chunking 的预测值 |
+| 总状态预算 | `rem_total_tokens`、`cur_rem_tokens` | 分配新 KV、输出预留、页对齐、已有运行请求之后，物理状态还放得下吗？ | allocator 可用量 + tree 可驱逐量 - offset |
+
+设 $q$ 为 page size，$R$ 为当前请求未命中的 prompt 尾部，$C$ 为这个 prefill pass 尚未消费的 chunk 预算。通过总容量门之后，`add_one_req` 的核心选择可以近似写成：
+
+$$
+\widehat R = \left\lceil\frac{R}{q}\right\rceil q,\qquad
+E =
+\begin{cases}
+R, & C=\text{None}\ \text{或}\ \widehat R\le C,\\
+\left\lfloor\frac{C}{q}\right\rfloor q, & \widehat R>C.
+\end{cases}
+$$
+
+最后一个 chunk 可以只有 $R$ 个真实 token，不必填满一页；预算记账仍按 $\widehat R$ 扣减。若有 `truncation_align_size`，中间 chunk 还会继续向下对齐。`rem_total_tokens`/`cur_rem_tokens` 不是简单塞进上式的另一个 `min`：`add_one_req` 会先用完整候选的 `total_tokens` 做容量拒绝，可能直接返回 `NO_TOKEN`；已有 chunk 的下一轮才在 `add_chunked_req` 中用 `min(rem_chunk_tokens, rem_total_tokens)` 决定可继续的长度。`rem_input_tokens` 则主要是 pass 级继续/停止门：每加入请求后由 `_update_prefill_budget` 扣减，耗尽后通常不再接纳后续请求。真正的分支应以 [`PrefillAdder.add_one_req`](../../python/sglang/srt/managers/schedule_policy.py#L1177-L1404)、[`add_chunked_req`](../../python/sglang/srt/managers/schedule_policy.py#L973-L1022) 和 [`_update_prefill_budget`](../../python/sglang/srt/managers/schedule_policy.py#L833-L889) 为准。
+
+当 `rem_chunk_tokens is None`（例如 `chunked_prefill_size=-1`）时不会进入中间 chunk 分支；`max_prefill_tokens` 仍参与 batch admission，但源码对空 `can_run_list` 的第一条请求保留了“先接纳再记账”的特殊路径。不要把关闭 chunking 理解成“任何超过 `max_prefill_tokens` 的单请求都立刻拒绝”。
+
+### 10.2 配置值怎样进入 scheduler
+
+`Scheduler.init_chunked_prefill()` 从 schedule 配置读取 `chunked_prefill_size`，非正值会转成 `None`，而 multimodal + Transformers backend 会主动禁用这一功能；同一个入口还决定是否打开 mixed chunk 和 PP dynamic chunking。见 [`init_chunked_prefill`](../../python/sglang/srt/managers/scheduler.py#L1221-L1259)。
+
+配置解析和运行时覆盖可以按下面的顺序读：
+
+`ServerArgs.chunked_prefill_size` 先经过 schedule 配置和 GPU-memory hook 的默认值解析，再由 `Scheduler.init_chunked_prefill()` 归一化；每轮 `_get_new_batch_prefill_raw()` 用它建立 `PrefillAdder`，最后由 `add_one_req()` / `add_chunked_req()` 消费。这样读比把配置值直接当成 forward 长度更准确。
+
+在 [`server_args.py`](../../python/sglang/srt/server_args.py#L713-L718) 中，这个参数的语义就是“一个 chunk 的最大 token 数”；`-1` 表示关闭。没有用户显式设置时，[`handle_gpu_memory_settings`](../../python/sglang/srt/arg_groups/memory_hook.py#L62-L150) 会按 GPU memory 选择一个启发式值（例如小显存通常是 2048，中等显存可能是 4096/8192，更大显存可能是 16384）。这不是 prompt 长度，也不是 decode batch size；它是 admission 时用于切分 extend 的上限。DP attention 还会在 [`parallel_hook.py`](../../python/sglang/srt/arg_groups/parallel_hook.py#L191-L207) 按 DP size 缩小它；除 decode-disagg 的特殊验证路径外，正数值必须满足 page-size 对齐约束（[`validation_hook.py`](../../python/sglang/srt/arg_groups/validation_hook.py#L101-L107)）。
+
+这里有两个容易混淆的“动态”：
+
+1. **GPU-memory 默认值**只在用户没有提供值时补一个初始 chunk size。
+2. **PP dynamic chunking**是在已有 chunked request 继续执行时，根据历史长度和 profile predictor 临时替换本轮的 `chunked_prefill_size`；调用入口在 [`_get_new_batch_prefill_raw`](../../python/sglang/srt/managers/scheduler.py#L3599-L3606)，预测器在 [`predict_next_chunk_size`](../../python/sglang/srt/managers/scheduler_pp_mixin.py#L770-L802)。所以调试日志里某一轮的实际 chunk 可以和启动参数不同（可能变小，也可能变大，但受 `max_prefill_tokens`、context length 和 page alignment 约束），不代表配置被改写。
+
+### 10.3 一次调度 pass 的真实主线
+
+下面只保留和问题有关的代码骨架；标记为“源码压缩片段”，变量名和调用顺序对应当前 main，省略了优先级、LoRA、hicache 等旁支。
+
+```python
+# 源码压缩片段：scheduler.py:_get_new_batch_prefill_raw
+chunk_limit = self.chunked_prefill_size
+if self.chunked_req is not None and self.enable_dynamic_chunking:
+    chunk_limit = self.predict_next_chunk_size(
+        len(self.chunked_req.prefix_indices)
+    ) or chunk_limit
+
+adder = PrefillAdder(
+    self.page_size,
+    self.tree_cache,
+    self.token_to_kv_pool_allocator,
+    running_batch,
+    self.new_token_ratio_tracker.current,
+    self.max_prefill_tokens,  # rem_input_tokens
+    chunk_limit,               # rem_chunk_tokens
+    running_bs if self.is_mixed_chunk else 0,
+    ...,
+)
+
+if self.chunked_req is not None:
+    self.chunked_req.init_next_round_input()
+    self.chunked_req = adder.add_chunked_req(self.chunked_req)
+
+for req in self.waiting_queue:
+    req.init_next_round_input(self.tree_cache)
+    result = adder.add_one_req(req, ...)
+    if result != AddReqResult.CONTINUE:
+        break
+
+if adder.new_chunked_req is not None:
+    self.chunked_req = adder.new_chunked_req
+if self.chunked_req is not None:
+    self.chunked_req.inflight_middle_chunks += 1
+
+batch = ScheduleBatch.init_new(..., chunked_req=self.chunked_req)
+batch.prepare_for_extend()
+```
+
+对应的真实入口是 [`get_next_batch_to_run`](../../python/sglang/srt/managers/scheduler.py#L3342-L3489) → [`get_new_batch_prefill`](../../python/sglang/srt/managers/scheduler.py#L3511-L3536) → [`_get_new_batch_prefill_raw`](../../python/sglang/srt/managers/scheduler.py#L3538-L3793)。这条链说明了“选择”发生在哪里：scheduler 先处理上一轮 chunk 的缓存/合并，再让 `PrefillAdder` 依据当前池状态构造 `can_run_list`，最后由 `ScheduleBatch.prepare_for_extend()` 把每条请求的 `extend_range` 变成 forward 输入和写地址。
+
+可以把 producer、owner、carrier、consumer 写成一张小表：
+
+| 阶段 | producer | owner / carrier | consumer |
+|---|---|---|---|
+| 预算建立 | scheduler、allocator、tree cache | `PrefillAdder.rem_*` | `add_one_req` / `add_chunked_req` |
+| 选择区间 | `Req.init_next_round_input` 提供 prefix/full ids | `Req.extend_range`、`adder.can_run_list` | `ScheduleBatch` |
+| forward 读写 | `prepare_for_extend` | `input_ids`、prefix loc、`out_cache_loc` | attention backend / model runner |
+| 中间 chunk 生命周期 | batch result processor | `Scheduler.chunked_req`、`inflight_middle_chunks` | 下一轮 scheduler 或最终采样 |
+
+### 10.4 `add_one_req` 的两个分支
+
+先定义四个读代码时要反复代入的量：
+
+* $P = \lvert\texttt{req.prefix\_indices}\rvert$：prefix tree 命中的、已经有 K/V 的长度。
+* $L = \lvert\texttt{req.full\_untruncated\_fill\_ids}\rvert$：完整 prompt（含命中 prefix）。
+* $R = L-P$：本轮真正需要计算的 prompt 尾部。
+* $C = \texttt{chunk\_tokens\_limit}$：当前 pass 尚未消费的共享 chunk 预算，可能还受到 SWA 或 dynamic chunking 限制。
+
+在锁定 tree node 并再次检查池预算后，正式代码有一个非常关键的二分：
+
+```python
+# 源码压缩片段：schedule_policy.py:add_one_req
+input_tokens = ceil_paged_tokens(
+    len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+)
+
+if chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
+    # 整个剩余 prompt 一次提交
+    req.set_extend_range(
+        len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+    )
+    self.can_run_list.append(req)
+    self._update_prefill_budget(prefix_len, input_tokens, max_new_tokens, ...)
+else:
+    # 至少保留一个 page，并向下按 page 对齐
+    trunc_len = chunk_tokens_limit // self.page_size * self.page_size
+    req.set_extend_range(
+        len(req.prefix_indices), len(req.prefix_indices) + trunc_len
+    )
+    self.can_run_list.append(req)
+    self.new_chunked_req = req
+    self._update_prefill_budget(prefix_len, trunc_len, 0, ...)
+```
+
+这是对 [`add_one_req` 的 full/chunk 分支](../../python/sglang/srt/managers/schedule_policy.py#L1301-L1404) 的教学压缩。要注意三个细节：
+
+1. `input_tokens` 是 page-ceil 后的估计，真正的 `extend_range` 还会再次向下对齐；所以实际 chunk 可以比配置值小，而不会跨页写入。
+2. **完整分支**把 `max_new_tokens` 计入总预算，因为最后一个 prompt chunk 之后还要为该请求保留 decode headroom；**中间 chunk 分支**传 `max_new_tokens=0`，避免在每个中间段重复预留输出空间。
+3. `total_tokens = cand_extend_input_len + max_new + page_size` 在前面先做一次快速拒绝，拿到 tree lock 后又检查一次；这正是“chunk 上限足够”仍然可能因为 KV/页/状态不够而不能准入的原因。
+
+### 10.5 中间 chunk 怎样回到下一轮
+
+假设 `page_size = 4`、没有 prefix 命中、prompt 长度为 18、有效 `C = 8`，忽略显存总预算的额外拒绝：
+
+| forward | `prefix_indices`（进入前） | 本轮 `extend_range` | 是否还有尾部 |
+|---|---:|---|---|
+| 1 | 0 | `[0, 8)` | 是 |
+| 2 | 8 | `[8, 16)` | 是 |
+| 3 | 16 | `[16, 18)` | 否，变成最后一个 prefill chunk |
+
+第一轮 `add_one_req` 进入 chunk 分支并把 `self.chunked_req` 指向该请求。下一轮 [`get_next_batch_to_run`](../../python/sglang/srt/managers/scheduler.py#L3368-L3380) 会先把上一段新增 KV stash/cache，再把这个请求从“已完成可合并”的集合中排除；随后 `add_chunked_req` 用
+
+```python
+_rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+```
+
+重新计算本轮最多能追加多少，并更新 `extend_range`（真实代码见 [`add_chunked_req`](../../python/sglang/srt/managers/schedule_policy.py#L973-L1022)）。因此 chunk 不只是把一个长 `input_ids` 切成 Python 列表；每一轮前缀都要经过 cache owner 的提交，下一轮才能把它当作可读 prefix。
+
+`stash_chunked_request` 最终会调用 [`maybe_cache_unfinished_req`](../../python/sglang/srt/mem_cache/common.py#L161-L166)，树 cache 的实现会把已完成的有效前缀插回 radix 结构（[`UnifiedRadixCache.cache_unfinished_req`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#L925-L985)）。batch result 侧用 `inflight_middle_chunks` 区分“中间段还没结束”和“可以输出/释放”：[`process_batch_result_prefill`](../../python/sglang/srt/managers/scheduler_components/batch_result_processor.py#L240-L454) 在中间段只递减计数、更新 chunked logprob，不把它当成最终完成。
+
+### 10.6 多请求和 mixed chunk：`C` 是这一轮共享的
+
+`chunked_prefill_size` 初始化的是 `PrefillAdder.rem_chunk_tokens`，而 `_update_prefill_budget` 会在每加入一条请求后从中扣掉 page-ceil 后的 extend 长度。因此它既是单条请求不可能超过的上限，也是**这一轮 prefill batch 共享的 chunk budget**：前面的短请求可以先完整加入，后面的长请求只能使用剩余量并成为 `new_chunked_req`。所以 batch 的 `extend_num_tokens` 可以由多个请求的片段组成，但通常不会超过本轮有效的初始 $C$；它还会同时受 `rem_input_tokens`、物理池和 request-row 数量约束。某条请求的剩余 prompt 小于当前 `rem_chunk_tokens` 时，它直接走完整分支，不会为了“凑满 chunk”人为补 token。
+
+例如 `page_size=16`、本轮有效 $C=8192$：请求 A 的未命中尾部是 5000，B 的未命中尾部是 10000。A 走完整分支，但预算按 $\lceil5000/16\rceil\times16=5008$ 扣掉；B 只能拿到剩余 3184（仍是 page 对齐的中间 chunk），而不是再拿一个独立的 8192。这个小例子正是正式 SGLang 与 mini 中“共享 `token_budget`”的共同直觉。
+
+`enable_mixed_chunk` 是另一个开关：打开后，scheduler 可以把新 prefill chunk 与已有 running decode batch 合成一个 forward（[`mixed-style chunked prefill`](../../python/sglang/srt/managers/scheduler.py#L3813-L3846)）。它主要改变“prefill 和 decode 是否同一轮发射”，但也会把 `running_bs` 作为 `num_mixed_decode_tokens` 从 `rem_input_tokens` 和 `rem_chunk_tokens` 中扣掉（[`PrefillAdder.__init__`](../../python/sglang/srt/managers/schedule_policy.py#L478-L514)），所以 decode token 多时，可留给 prefill 的共享预算会相应变小。调试时先分开问：
+
+1. 这条请求本轮拿了多少 `extend_range`？——看 `PrefillAdder` 和 `Req`。
+2. 这轮是否同时带了 decode 请求？——看 `is_mixed_chunk` 和 `new_batch.decoding_reqs`。
+
+### 10.7 和 mini-SGLang 的精确对照
+
+| mini-SGLang | 正式 SGLang | 不能忽略的差别 |
+|---|---|---|
+| `SchedulerConfig.max_extend_tokens` | `chunked_prefill_size`（本轮可由 PP dynamic predictor 覆盖） | 都初始化一次 prefill pass 的共享 extend budget；正式版还按 page、SWA/Mamba、allocator 和 tree cache 再裁剪 |
+| `prefill_budget` | 主要对应 `rem_chunk_tokens`，正式版另有 `rem_input_tokens` | 正式版把 chunk budget 和 prefill-batch 输入停止预算拆开维护 |
+| `reserved_size` / decode in-flight | `rem_total_tokens`、`cur_rem_tokens`、running-batch offset | 正式版把物理 KV、输出预留、页 overhead、状态 slot 一起纳入 admission |
+| `ChunkedReq` | `Scheduler.chunked_req` + `Req.inflight_middle_chunks` | 正式版还要和 radix cache、overlap/PP/PD 生命周期对接 |
+
+所以一个可操作的近似是：
+
+> mini 的 `max_extend_tokens` 大致对应正式 SGLang 的 `chunked_prefill_size`，但绝不等于“正式 SGLang 一次 forward 的全部预算”。
+
+如果只想定位“为什么这轮不是 8192”，按这个顺序查：
+
+1. `Scheduler.chunked_prefill_size` 是否被设成 `None`、被 DP 除小，或被 PP dynamic predictor 替换。
+2. 请求的 `prefix_indices` 命中了多少，剩余 $R$ 是否本来就小于上限。
+3. `PrefillAdder.rem_input_tokens`、`rem_total_tokens`、`cur_rem_tokens` 是否先耗尽。
+4. page size / `truncation_align_size` 是否把候选值向下裁掉。
+5. 如果只关心“是否和 decode 同轮”，再查 `enable_mixed_chunk`，不要把它和 chunk size 混为一谈。
+
+## 11. PD 分离：同一个 prompt 的 KV 怎样从 P 侧交给 D 侧
+
+### 11.1 PD 不是把一个 scheduler 横向切成两半
+
+PD（Prefill/Decode disaggregation）把两个阶段放到两个 scheduler/进程上：P 侧负责 prompt 的 prefill 和 KV 发送，D 侧负责接收 KV、提交首个采样 token，然后继续 decode。仓库用 [`DisaggregationMode.NULL/PREFILL/DECODE`](../../python/sglang/srt/disaggregation/utils.py#L101-L112) 选择事件循环；[`dispatch_event_loop`](../../python/sglang/srt/managers/scheduler.py#L5442-L5469) 再按 mode 和 overlap/PP 选择具体实现。部署参数和 transfer backend 示例另见仓库的 [PD Disaggregation 指南](../../docs/docs/advanced_features/pd_disaggregation.mdx)；本节只追状态 owner 和请求生命周期。
+
+用户请求仍然只有一个 `rid`，但它在 P、D 两侧各有一份本地 `Req` 和各自的 pool row。跨进程真正交接的是：
+
+* KV page（或 flat/unified-memory 地址经过 transfer translation 后的 page index）；
+* 最终 chunk 的 metadata，包括 P 侧采出的第一个 output token、cached-token 统计、logprob/采样 mask，以及必要的 recurrent/index state payload；
+* bootstrap room、TP/PP/DP rank 等传输协议状态。
+
+因此不要把 PD 理解成“P 把 GPU Tensor 指针交给 D”。D 侧先分配自己的目标页和 metadata slot，P 侧再按照 D 给出的接收协议写入/发送；两边的 row ID 不需要相同，且不能直接互相解引用。
+
+### 11.2 两边各自拥有的队列
+
+| 侧 | 队列 / owner | 主要职责 | 进入下一阶段的条件 |
+|---|---|---|---|
+| P | `PrefillBootstrapQueue` | 建 sender、握手、等 D 侧 destination/metadata 能用 | bootstrap 完成后移到 P 的 waiting queue |
+| P | 普通 `waiting_queue` + `PrefillAdder` | 按第 10 节的规则选择完整或中间 chunk，运行 forward | 每个 chunk 的 KV 可发送；最后 chunk 进入 inflight |
+| P | `disagg_prefill_inflight_queue` | 非阻塞轮询最后一段 KV transfer | transfer success 后释放 P 侧请求状态并返回结果 |
+| D | `DecodePreallocQueue` | 为 prompt KV 预分配目标 row/page（可利用 D 侧 prefix hit），并为 decode 留容量余量 | `send_metadata` 发布 destination 后进入 transfer queue |
+| D | `DecodeTransferQueue` | 轮询网络/IPC transfer，读取 metadata，commit 首 token | success 后把请求放入 D 的 waiting queue |
+| D | `waiting_queue` → decode batch | 普通 decode admission/forward | 每个生成 token 继续循环 |
+
+P 侧模块文件开头就把这条生命周期写成三段：bootstrap → waiting/`PrefillAdder` → inflight/轮询（[`prefill.py` module doc](../../python/sglang/srt/disaggregation/prefill.py#L1-L18)）。D 侧对应的 prealloc owner 是 [`DecodePreallocQueue`](../../python/sglang/srt/disaggregation/decode.py#L316-L390)，transfer owner 则是 [`DecodeTransferQueue`](../../python/sglang/srt/disaggregation/decode.py#L2020-L2057)。
+
+### 11.3 一条 P→D 的时序图
+
+```mermaid
+sequenceDiagram
+    participant C as Client/Router
+    participant P as Prefill scheduler
+    participant PB as P BootstrapQueue + Sender
+    participant DQ as D PreallocQueue + Receiver
+    participant D as Decode scheduler
+
+    C->>P: request(prompt, sampling params)
+    P->>PB: create_sender + bootstrap handshake
+    C->>D: same request metadata / bootstrap room
+    D->>DQ: allocate destination row/pages
+    DQ-->>PB: destination metadata + prefix boundary
+    PB-->>P: bootstrap complete → waiting_queue
+    P->>P: PrefillAdder chooses chunk and forward
+    P->>PB: send_kv_chunk(middle, page-aligned)
+    P->>P: cache unfinished chunk; schedule next chunk
+    P->>PB: send_kv_chunk(last, KV pages + output metadata)
+    PB-->>DQ: transfer completion / metadata ready
+    DQ->>D: commit first output token + cached stats
+    D->>D: waiting_queue → normal decode batch
+    D-->>C: streamed output tokens
+```
+
+这张图故意把“destination 先分配、source 后发送”画出来。真正的事件循环分别在 [`event_loop_normal_disagg_prefill`](../../python/sglang/srt/disaggregation/prefill.py#L594-L631) 和 [`event_loop_normal_disagg_decode`](../../python/sglang/srt/disaggregation/decode.py#L2448-L2485)；overlap 版本只是把 result/transfer 的 CPU 轮询与下一次 forward 交错，并没有改变 owner 关系。
+
+### 11.4 P 侧：chunk 的选择和发送是同一条生命周期，但不是同一个函数
+
+PD P 侧每轮仍然调用普通的 [`get_new_batch_prefill`](../../python/sglang/srt/disaggregation/prefill.py#L568-L592)，所以第 10 节的 `PrefillAdder` 规则完全适用。PD 额外插入的是“上一 chunk 的 transfer 进度处理”：
+
+```python
+# 源码压缩片段：prefill.py
+def get_next_disagg_prefill_batch_to_run(running_batch, last_batch):
+    self.resolve_waiting_queue_bootstrap()
+    self.process_prefill_chunk(last_batch, running_batch)
+    plan = self.get_new_batch_prefill(running_batch)
+    return plan
+
+def process_prefill_chunk(last_batch, running_batch):
+    if self.chunked_req is not None:
+        maybe_cache_unfinished_req(self.chunked_req, self.tree_cache, chunked=True)
+        if self.enable_overlap:
+            self.chunked_req.tmp_end_idx = min(
+                self.chunked_req.extend_range.end,
+                len(self.chunked_req.origin_input_ids),
+            )
+        else:
+            self.send_kv_chunk(self.chunked_req)
+```
+
+这是 [`get_next_disagg_prefill_batch_to_run`](../../python/sglang/srt/disaggregation/prefill.py#L568-L592) 和 [`process_prefill_chunk`](../../python/sglang/srt/disaggregation/prefill.py#L1081-L1112) 的压缩片段。`maybe_cache_unfinished_req(..., chunked=True)` 的作用是让下一轮 prefill 能读到上一轮已经写好的前缀；`send_kv_chunk` 的作用是把这些已写好的页交给 D。两者都处理“当前 chunk”，但一个更新 P 侧 cache owner，一个触发跨节点 transfer，不能相互替代。
+
+`run_batch` 还支持在 forward 发射前可选地早发已经命中的 prefix（[`maybe_send_cached_prefix_chunk`](../../python/sglang/srt/disaggregation/prefill.py#L1124-L1161)）；这只优化传输重叠，不改变 `PrefillAdder` 对未命中 suffix 的选择。
+
+### 11.5 `send_kv_chunk` 究竟发送什么
+
+把 [`send_kv_chunk`](../../python/sglang/srt/disaggregation/prefill.py#L1163-L1351) 读成下面三个动作最清楚：
+
+1. **确定范围。** `start_idx = req.start_send_idx`，`end_idx` 来自本轮 `extend_range.end`；非最后 chunk 向下 page-align，不能把半页提前发走。
+2. **翻译地址。** 从 P 侧 `req_to_token_pool` 取出 loc，再用 allocator 的 `translate_kv_indices_for_transfer` 转成 transfer engine 要用的 physical/page indices。
+3. **最后一段附带状态。** `last_chunk=True` 时填 metadata buffer，并根据 `state_types` 生成 Mamba/SWA/DSA/C128 等附加 state indices；然后 sender 对每个 segment 调 `send(page_indices, state_indices, num_kv_tokens=...)`。
+
+如果启用了 staging buffer，非最后 chunk 还要按 `staging_grid_tokens(get_schedule().chunked_prefill_size, page_size)` 对齐网格（[`send_kv_chunk` staging 分支](../../python/sglang/srt/disaggregation/prefill.py#L1181-L1193)）。这解释了一个很实用的现象：**普通 chunk 的计算边界由 `PrefillAdder` 预算决定，staging 的传输分段边界还可能受同一个 chunk size 的 page/grid 约束。**
+
+P 侧最终结果处理把“中间 chunk”和“最后 chunk”分开：当 `inflight_middle_chunks > 0` 时只递减计数，必要时发送 `last_chunk=False`；计数归零时追加 `next_token_id`、写 metadata，并发送 `last_chunk=True`（[`process_batch_result_disagg_prefill`](../../python/sglang/srt/disaggregation/prefill.py#L684-L859)）。所以 PD 的首个生成 token 是最终 prefill forward 的结果，不是每一个 prompt chunk 都采一个 token。
+
+### 11.6 D 侧：它不选择 prompt chunk，只准备接收空间和 decode 余量
+
+D 侧收到请求后，`DecodePreallocQueue.add()` 创建 receiver 并排队；[`pop_preallocated`](../../python/sglang/srt/disaggregation/decode.py#L1195-L1337) 会检查可撤回 token、pool/metadata 容量和 `max_new_tokens`/reserved decode headroom，然后为该请求建立目标映射。如果启用了 D 侧 radix cache，它先匹配并锁住本地 prefix，只为缺失的 prompt 尾部分配/发布目标页。预分配完成后，它把目标 page indices、metadata buffer index、state indices 和 `decode_prefix_len` 通过 `send_metadata` 发布给 P：
+
+```python
+# 源码压缩片段：decode.py:pop_preallocated
+decode_req.metadata_buffer_index = metadata_allocator.alloc()
+page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
+state_indices = [...]  # 与 P 侧 state_types 对齐
+decode_req.kv_receiver.send_metadata(
+    page_indices,
+    decode_req.metadata_buffer_index,
+    state_indices,
+    decode_prefix_len=total_prefix_len,
+)
+decode_transfer_queue.extend([decode_req])
+```
+
+真实发送点在 [`pop_preallocated`](../../python/sglang/srt/disaggregation/decode.py#L1474-L1532)，而不是 `get_next_disagg_decode_batch_to_run`；后者只在 transfer 成功后把 ready request 组成 decode batch（[`get_next_disagg_decode_batch_to_run`](../../python/sglang/srt/disaggregation/decode.py#L2559-L2590)）。这就是为什么“chunk 怎么切”要去看 P 侧 `PrefillAdder`，不能在 D 侧 decode scheduler 里找一个同名 `max_extend_tokens`。
+
+transfer 成功后，D 侧 [`_commit_transfer_to_req`](../../python/sglang/srt/disaggregation/decode.py#L2059-L2211) 从 metadata buffer 读取 `output_id` 和 cached-token/logprob/state 信息，追加首个 output token，清掉 receiver，再由 [`process_decode_queue`](../../python/sglang/srt/disaggregation/decode.py#L2667-L2701) 放入 D 的 waiting queue。之后才进入普通 decode forward；D 不会重新对 prompt 做 prefill，也不会重新选择 P 侧的 chunk 边界。
+
+### 11.7 PD 下谁在什么时候拥有哪份状态
+
+| 状态 | P 侧何时拥有/修改 | D 侧何时拥有/修改 | 释放边界 |
+|---|---|---|---|
+| P 的 `Req` row、P 的 KV pages | bootstrap 后分配；每个 chunk forward 写入 | 不可直接读 P 的 row/page | transfer 成功后 P 调 `release_kv_cache`，并解锁 P tree |
+| D 的 `Req` row、目标 KV pages | 只知道由 D metadata 发布的目标 | prealloc 时分配，transfer 时填充，之后供 decode 读写 | D 请求完成或失败时按 decode cache 生命周期释放 |
+| metadata buffer | 最后 chunk 写 output id、统计和 state payload | `_commit_transfer_to_req` 读取 | transfer commit 后归还 metadata index |
+| bootstrap / transfer queue entry | sender/inflight queue 跟踪发送进度 | receiver/transfer queue 跟踪接收进度 | success/failure poll 后移除；失败路径可能延迟释放 |
+
+P 侧只有在 transfer poll 为 `Success` 后才释放自己的 KV/锁（[`process_disagg_prefill_inflight_queue`](../../python/sglang/srt/disaggregation/prefill.py#L876-L979)）。这也是 unified-memory 模式需要 move gate 的原因：只看 queue 是否为空不够，已经发布给 peer、但尚未完成 transfer 的 page 仍不能搬家（[`unified_memory_disagg_move_gate`](../../python/sglang/srt/disaggregation/utils.py#L115-L151)）。
+
+### 11.8 PD 与 chunked prefill 的交叉点
+
+把两者叠在一起时，顺序应记成：
+
+```mermaid
+flowchart LR
+    A["D 侧预分配目标空间<br/>发布 metadata"] --> B["P 侧 bootstrap 完成"]
+    B --> C["P 侧 PrefillAdder<br/>选择 chunk"]
+    C --> D["中间 chunk：cache<br/>+ 可选 send"]
+    D --> C
+    C --> E["最后 chunk：首 token<br/>+ KV/metadata"]
+    E --> F["D 侧 transfer commit"]
+    F --> G["D 侧进入 decode"]
+```
+
+所以：
+
+* PD 不会把 `chunked_prefill_size` 变成 D 侧的 decode chunk 配置；prompt 的切分仍由 P 侧 `PrefillAdder` 决定。
+* D 侧为缺失的 prompt KV 分配目标页，同时把 `max_new_tokens`/reserved decode tokens 纳入容量检查；它等待 P 分段填充，不等于 D 侧也逐段执行 prompt forward。
+* 开启 staging 时，P/D 两侧都要使用一致的 page/grid 协议；`chunked_prefill_size` 会影响传输网格，但仍不能替代 `rem_total_tokens` 等计算 admission 预算。
+* overlap 只改变“何时调用 `send_kv_chunk`、何时轮询结果”的时间关系，不改变 chunk 的 owner 和最终 transfer 成功前的释放边界。
+
+## 12. mini-SGLang 与正式 SGLang：为什么看起来一个简单、一个复杂
+
+### 12.1 mini 其实也有“真 chunk”，只是状态面更窄
+
+mini-SGLang 的 `SchedulerConfig` 把 `max_extend_tokens` 暴露成配置，scheduler 初始化时把它放进 `prefill_budget`（[`Scheduler.__init__`](https://github.com/sgl-project/mini-sglang/blob/9a91cfafe754aa85daee49998176275667eb58f2/python/minisgl/scheduler/scheduler.py#L45-L73)）；其 `PrefillManager`/`PrefillAdder` 在 pending request 仍有剩余 prompt 时构造 `ChunkedReq`，下一轮复用同一个 request/table/cache 状态。这里把 mini 的对照固定在 commit `9a91cfafe754aa85daee49998176275667eb58f2`，可以沿 [`SchedulerConfig`](https://github.com/sgl-project/mini-sglang/blob/9a91cfafe754aa85daee49998176275667eb58f2/python/minisgl/scheduler/config.py#L14-L37)、[`PrefillAdder` 与 chunk continuation](https://github.com/sgl-project/mini-sglang/blob/9a91cfafe754aa85daee49998176275667eb58f2/python/minisgl/scheduler/prefill.py#L32-L151)、[`PrefillManager.schedule_next_batch`](https://github.com/sgl-project/mini-sglang/blob/9a91cfafe754aa85daee49998176275667eb58f2/python/minisgl/scheduler/prefill.py#L117-L162) 逐跳核对。
+
+所以更公平的说法不是“mini 只有一个固定 forward”，而是：
+
+* mini 用一个会逐请求递减的 `token_budget` 同时表达这轮 prefill pass 的总 extend 上限和当前请求可用的 chunk，再用 `reserved_size` 表达 cache 压力；
+* 正式 SGLang 保留同样的 chunk 直觉，再加上 page alignment、prefix tree、running decode、SWA/Mamba state、PP/DP、overlap 和 PD transfer 的生命周期；
+* 两者都可能对一个长 prompt 做多次 forward，差别在于正式版本一次 admission 的约束和跨组件交接更多。
+
+### 12.2 一张“职责而不是类名”的映射
+
+| 观察问题 | mini 的答案 | 正式 SGLang 的答案 |
+|---|---|---|
+| 本轮从 prompt 取多少？ | `token_budget` / `max_extend_tokens` | `rem_chunk_tokens` 与 `rem_input_tokens` 共同裁剪，再过总状态预算 |
+| prefix 命中后从哪里继续？ | `cached_len`、table handle | `prefix_indices`、`last_node`、tree lock、`Req.extend_range` |
+| 中间 chunk 之后如何续？ | `ChunkedReq` 放回 pending/front | `Scheduler.chunked_req`，先 stash/cache，再 `init_next_round_input` + `add_chunked_req` |
+| 什么时候产生 output token？ | 最后一个 prefill/forward 完成后 | `inflight_middle_chunks` 清零的最终 prefill chunk；PD 下再写 transfer metadata |
+| 谁消费 KV？ | 同一个 Engine 内的 decode | 普通模式是同一 scheduler；PD 模式是 D 侧独立 pool/receiver |
+
+用一句近似关系记忆：
+
+$$
+\texttt{mini.max\_extend\_tokens}
+\ \approx\ \texttt{SGLang.chunked\_prefill\_size}
+\ \ne\ \text{SGLang 的完整 admission 规则}。
+$$
+
+这里的“不等于”很重要：如果只把正式 SGLang 的 `chunked_prefill_size` 抄成 mini 的 `max_extend_tokens`，会漏掉“本轮 batch 还剩多少 `max_prefill_tokens`”以及“allocator/tree cache 是否真的能承受这一段”的两个外层门槛。
+
+### 12.3 从 mini 迁移到正式源码的五步
+
+1. 先在 scheduler 里找到 [`_get_new_batch_prefill_raw`](../../python/sglang/srt/managers/scheduler.py#L3538-L3793)，确认本轮传给 `PrefillAdder` 的实际 `chunk_limit`。
+2. 再在 request 上打印 `len(prefix_indices)`、`len(full_untruncated_fill_ids)`、`extend_range`，区分 cache hit 与本轮新计算。
+3. 同时观察 `rem_input_tokens`、`rem_chunk_tokens`、`rem_total_tokens`，不要只打印一个 chunk size。
+4. 如果是 PD，继续看 P 的 `start_send_idx`/`pending_chunk_rids` 和 D 的 `metadata_buffer_index`/transfer queue；不要在 D 的 decode batch 中寻找 prompt chunk 决策。
+5. 最后才判断是否需要 `enable_mixed_chunk`、overlap、staging 或 dynamic chunking；这些是发射/传输策略，不能代替基本 chunk 选择。
+
+## 13. 按现象反查 chunk 和 PD 状态
+
+下面的表适合直接贴到调试笔记里。每一行先看左侧现象，再跳到 owner，而不是从 transfer backend 或 CUDA kernel 反向猜。
+
+| 现象 | 首先查看 | 通常意味着什么 |
+|---|---|---|
+| 长 prompt 仍然一次性 prefill | `Scheduler.chunked_prefill_size`、`req.extend_range` | chunk 被关闭，或剩余未命中 prompt 本来就不超过有效上限 |
+| 配置 8192，但本轮只有 4096/更少 | `rem_chunk_tokens`、`rem_input_tokens`、`rem_total_tokens`、page size | 前面的请求已消费共享 chunk budget，或 batch 总输入/物理 KV/页对齐先成为瓶颈；也可能是 DP 除小或 PP dynamic override |
+| 每轮都只得到一个 page | `trunc_len`、`page_size`、`truncation_align_size` | 候选预算被向下 page/attention split 对齐，或只剩一个可用页 |
+| 下一轮没有继续同一请求 | `self.chunked_req`、`stash_chunked_request`、`inflight_middle_chunks` | 上一 chunk 没有正确提交/cache，或请求已进入最终 chunk/abort 路径 |
+| P 侧 forward 完了但 D 侧没有 decode | P `pending_bootstrap` / `disagg_prefill_inflight_queue`、D `DecodePreallocQueue` | bootstrap、destination prealloc 或 transfer 尚未成功；还没到 decode scheduler |
+| D 已发 metadata，P 没有发送页 | P `start_send_idx`、`send_kv_chunk`、`disagg_prefill_pending_chunk_rids` | P 侧 chunk 尚未 materialize，或非最后 chunk 等待 page/grid 对齐 |
+| P 侧 transfer 成功但仍看到 page 被占用 | `process_disagg_prefill_inflight_queue`、tree lock/ref | 先确认 sender poll 是否真的 `Success`；成功后才会 `release_kv_cache`，tree eviction 仍可能延后物理回收 |
+| staging 模式启动即报参数错误 | `chunked_prefill_size % page_size`、MLA/CP/PP 限制 | staging 需要正的 page-aligned grid，并有 backend/parallelism 限制 |
+| mixed chunk 延迟变化但 chunk 长度没变 | `is_mixed_chunk`、`new_batch.decoding_reqs` | 这是 prefill/decode 是否同轮发射的变化，不是 `PrefillAdder` 重新切分 |
+
+### 13.1 一个最小的打印清单
+
+不改算法时，给 scheduler 加临时 debug 日志，至少把下面字段成组打印；单独打印 `chunked_prefill_size` 信息不足：
+
+```text
+rid
+len(prefix_indices)
+len(full_untruncated_fill_ids)
+extend_range.start / extend_range.end
+chunked_prefill_size（本轮 effective 值）
+adder.rem_input_tokens / adder.rem_chunk_tokens
+adder.rem_total_tokens / adder.cur_rem_tokens
+inflight_middle_chunks
+
+PD-P: pending_bootstrap / start_send_idx / pending_chunk_rids
+PD-D: metadata_buffer_index / transfer_queue / receiver.poll()
+```
+
+这些字段分别落在 `Req`、`PrefillAdder`、P transfer owner 和 D transfer owner 四个状态域；把它们混成一个“当前长度”会再次回到第 4 节所说的 ID/长度误读。
+
+## 14. 补充后的自测：能不能解释“为什么这一轮是这几个 token”
+
+1. `chunked_prefill_size=8192` 时，一个已有 6000-token prefix hit、剩余 10000-token 的请求，第一轮候选 extend 从哪一个长度开始算？哪些预算还会把它裁小？
+2. 为什么 `rem_chunk_tokens` 足够，但 `rem_total_tokens` 不足时仍然不能 admission？请指出 page overhead、`max_new_tokens` 和 running-batch offset 分别在哪更新。
+3. 中间 chunk forward 结束后，为什么要先 `maybe_cache_unfinished_req`，并且不能立即把请求当成 decode 完成？请用 `inflight_middle_chunks` 解释。
+4. PD 模式下，哪个侧决定 prompt chunk？哪个侧先分配目标页？首个 output token 通过哪个 metadata buffer 从 P 到 D？
+5. 为什么 P 侧 transfer 成功前不能移动/释放已发布 page，即使请求已经从当前 forward batch 消失？请沿 `pending_chunk_rids`、inflight queue 和 unified-memory move gate 说清楚。
+6. 如果只想让 prefill 和 decode 同一轮发射，应该查哪个开关；如果想改变 prompt 每轮最大 extend，又应该查哪个字段？
+
+一句话收束这篇 Atlas 的新增部分：**正式 SGLang 的“真正 chunked prefill”由 P 侧 `PrefillAdder` 在多重预算下选择 `extend_range`，由 `Scheduler.chunked_req` 保存跨轮状态；PD 只是在这条 chunk 生命周期旁边增加 D 侧 destination preallocation、KV transfer 和最终 metadata commit，并没有把 chunk 选择搬到 D 侧。**

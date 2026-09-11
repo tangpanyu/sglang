@@ -560,19 +560,30 @@ def topk_from_pooled_history_logits(
         assert topk_offsets.shape[1] == 1
         topk_offsets = topk_offsets.squeeze(1)
 
-    if group_topk not in (128, 160, 192, 224, 256, 512, 2048):
-        raise NotImplementedError(
-            "index_kpool topk only supports pooled group_topk in "
-            f"(128, 160, 192, 224, 256, 512, 2048), got {group_topk} "
-            f"(topk={topk}, pool_size={pool_size})."
-        )
     if not logits.is_cuda or logits.dtype != torch.float32:
         raise NotImplementedError(
-            "index_kpool topk requires CUDA float32 logits; PyTorch topk fallback "
-            f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
+            "index_kpool topk requires CUDA float32 logits. "
+            f"Got device={logits.device}, dtype={logits.dtype}."
         )
 
-    if group_topk in (128, 160, 192, 224, 256, 512):
+    fast_group_topks = (128, 160, 192, 224, 256, 512, 2048)
+    if group_topk not in fast_group_topks:
+        # Production GLM shapes use one of the compiled buckets above. Tiny
+        # debug configs deliberately use a much smaller budget (for example,
+        # topk=8 and pool_size=4), so use PyTorch eager semantics instead
+        # of failing before the model reaches sparse attention.
+        assert page_table_row_index is None, (
+            "page_table_row_index requires the fused fast_kpool group_topk path"
+        )
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+
+        selected_groups = DSATopKBackend.TORCH.topk_func(
+            logits,
+            group_lengths,
+            group_topk,
+            row_starts=row_starts,
+        )
+    elif group_topk in (128, 160, 192, 224, 256, 512):
         from sglang.kernels.ops.moe.kpool_topk_transform import (
             fast_kpool_topk_transform_fused,
         )
@@ -596,18 +607,19 @@ def topk_from_pooled_history_logits(
         padded[: result.shape[0]] = result
         return padded
 
-    assert page_table_row_index is None, (
-        "page_table_row_index requires the fused fast_kpool group_topk path"
-    )
+    else:
+        assert page_table_row_index is None, (
+            "page_table_row_index requires the fused fast_kpool group_topk path"
+        )
 
-    from sgl_kernel import fast_topk_v2
+        from sgl_kernel import fast_topk_v2
 
-    selected_groups = fast_topk_v2(
-        logits,
-        group_lengths.to(torch.int32),
-        group_topk,
-        row_starts=row_starts,
-    )
+        selected_groups = fast_topk_v2(
+            logits,
+            group_lengths.to(torch.int32),
+            group_topk,
+            row_starts=row_starts,
+        )
 
     rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
     max_valid_groups = min(cols, group_topk)
