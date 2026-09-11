@@ -18,7 +18,7 @@ Falcon-H1 还同时有 Full Attention 分支，所以整模型仍有按 token �
 
 ![Falcon-H1 的 Full Attention 与 Mamba-2 状态地图](assets/day08_mamba2_state_map.svg)
 
-图后按三个源码跳转核对：request row 与 batch metadata 见 [`ReqKvInfo`](../../python/sglang/srt/managers/schedule_batch.py#848-877) 和 [`ForwardBatch`](../../python/sglang/srt/model_executor/forward_batch_info.py#393-435)；Full 侧的 `req_to_token → loc → K/V` 由 [`ReqToTokenPool`](../../python/sglang/srt/mem_cache/memory_pool.py#257-337) 与 [`MHATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#1809-1885) 持有；Mamba 侧的 `mapping[row] → slot`、backing tensor 和 layer view 由 [`HybridReqToTokenPool.alloc`](../../python/sglang/srt/mem_cache/memory_pool.py#1351-1405)、[`MambaPool.__init__`](../../python/sglang/srt/mem_cache/memory_pool.py#580-614) 和 [`mamba2_layer_cache`](../../python/sglang/srt/mem_cache/memory_pool.py#1414-1426) 完成。两条分支最后只在 [`FalconH1HybridAttentionDecoderLayer.forward`](../../python/sglang/srt/models/falcon_h1.py#315-367) 汇合 activation；allocator、payload 和 owner 不合并。
+图后按三个源码跳转核对：request row 与 batch metadata 见 [`ReqKvInfo`](../../python/sglang/srt/managers/schedule_batch.py#848-877) 和 [`ForwardBatch`](../../python/sglang/srt/model_executor/forward_batch_info.py#393-435)；Full 侧的 `req_to_token → loc → K/V` 由 [`ReqToTokenPool`](../../python/sglang/srt/mem_cache/memory_pool.py#270-392) 与 [`MHATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#1954-3071) 持有；Mamba 侧的 `mapping[row] → slot`、backing tensor 和 layer view 由 [`HybridReqToTokenPool.alloc`](../../python/sglang/srt/mem_cache/memory_pool.py#1426-1481)、[`MambaPool.__init__`](../../python/sglang/srt/mem_cache/memory_pool.py#524-614) 和 [`mamba2_layer_cache`](../../python/sglang/srt/mem_cache/memory_pool.py#1527-1528) 完成。两条分支最后只在 [`FalconH1HybridAttentionDecoderLayer.forward`](../../python/sglang/srt/models/falcon_h1.py#315-367) 汇合 activation；allocator、payload 和 owner 不合并。
 
 建议按三层读：**必读主线**是 1.1–1.8 → 2–7 → 8.1–8.3 → 9，先把 state、row/slot、普通 prefill/decode 和 owner 转移走通；**第二遍**再读 1.9–1.10 的 SSD scan 与第 10 节断点；第 8.4 和第 11 节是对照/进阶分支。这样不会把 tracking、speculative、int8 等优化细节误当成每个请求都必经的步骤。
 
@@ -502,7 +502,7 @@ Mamba-2 的核心公式短，是因为它把每一步写得很紧凑。读懂实
 | 本轮状态载体 | `ForwardBatch`、`Mamba2Metadata` | batch 转换、backend metadata 构造 | 本轮所有 Mamba 层复用 |
 | 只读前缀 checkpoint | `node.component_data[MAMBA].value` | cache boundary 的 component insert | 后续 prefix hit 复制；eviction 后归还 slot |
 
-`mamba_pool_idx` 在实际分配代码中来自 `mid[0]`，是 **0 维标量 tensor**；需要长度一向量时再 `unsqueeze(0)`。不要仅凭旧字段注释把它写成固定 `[1]`，证据见 [`alloc`](../../python/sglang/srt/mem_cache/memory_pool.py#L1351-L1395) 和 [`finalize_match_result_in_cache`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#L187-L216)。
+`mamba_pool_idx` 在实际分配代码中来自 `mid[0]`，是 **0 维标量 tensor**；需要长度一向量时再 `unsqueeze(0)`。不要仅凭旧字段注释把它写成固定 `[1]`，证据见 [`alloc`](../../python/sglang/srt/mem_cache/memory_pool.py#L1426-L1481) 和 [`finalize_match_result_in_cache`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#L187-L216)。
 
 `FULL=0`、`MAMBA=2` 只是 [`ComponentType`](../../python/sglang/srt/mem_cache/unified_cache/component_type.py#L6-L30) 的 namespace 索引。`node.component_data[FULL].value` 通常保存 token-loc 向量，MAMBA 的 value 保存 state-slot 向量；树没有把整块 conv/SSM tensor 塞进 node。
 
@@ -552,7 +552,7 @@ $$
 
 ### 3.2 真正分配 tensor 的位置
 
-`HybridReqToTokenPool` 得到上述 shape 后，在 [`_init_mamba_pool`](../../python/sglang/srt/mem_cache/memory_pool.py#L1263-L1281) 创建 `MambaPool`、`MambaSlotAllocator` 和全局 layer id 到 pool ordinal 的 `mamba_map`。随后 [`MambaPool.__init__`](../../python/sglang/srt/mem_cache/memory_pool.py#L580-L614) 真正分配 backing：
+`HybridReqToTokenPool` 得到上述 shape 后，在 [`_init_mamba_pool`](../../python/sglang/srt/mem_cache/memory_pool.py#L1280-L1317) 创建 `MambaPool`、`MambaSlotAllocator` 和全局 layer id 到 pool ordinal 的 `mamba_map`。随后 [`MambaPool.__init__`](../../python/sglang/srt/mem_cache/memory_pool.py#L524-L614) 真正分配 backing：
 
 ```python
 # 真实源码摘录：MambaPool.__init__ 普通 layout 分支
@@ -628,7 +628,7 @@ mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
 self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
 ```
 
-这段 [真实分配路径](../../python/sglang/srt/mem_cache/memory_pool.py#L1351-L1405) 的关键是 `holds_mamba`：全新 miss 才分 fresh active slot；已有 COW destination 或 chunk continuation 继续使用现有句柄。最后写 mapping，才把请求行与 active slot 绑定。主线 `extra_buffer` 还会分配 tracking buffer；overlap 开启时 [buffer 数量为 2](../../python/sglang/srt/mem_cache/memory_pool.py#L1227-L1234)。
+这段 [真实分配路径](../../python/sglang/srt/mem_cache/memory_pool.py#L1426-L1481) 的关键是 `holds_mamba`：全新 miss 才分 fresh active slot；已有 COW destination 或 chunk continuation 继续使用现有句柄。最后写 mapping，才把请求行与 active slot 绑定。主线 `extra_buffer` 还会分配 tracking buffer；overlap 开启时 [buffer 数量为 2](../../python/sglang/srt/mem_cache/memory_pool.py#L1254-L1255)。
 
 `alloc_for_extend` 同时从 token allocator 得到 `out_cache_loc`，并写入 `req_to_token[row, position]`，供 Full Attention 使用。5 个新 token 需要 5 个 Full token loc，却只推进一份 active Mamba state。
 
@@ -756,7 +756,7 @@ mixer_out, intermediate_states = mixer.forward(
 )
 ```
 
-[`mamba2_layer_cache`](../../python/sglang/srt/mem_cache/memory_pool.py#L1414-L1426) 先把全局 `layer_id` 映射到本 rank 的 pool ordinal，再切掉 backing 的 layer 轴。本 rank 的 Mamba 层共享请求的 slot 数字 7，但分别修改自己那一层的 `[7]`；TP/层切分时不要把它理解成跨 rank 的同一块物理行。这一层 view 和第 5 节的 metadata 合在一起，才是 mixer 完整的 state 输入。
+[`mamba2_layer_cache`](../../python/sglang/srt/mem_cache/memory_pool.py#L1527-L1528) 先把全局 `layer_id` 映射到本 rank 的 pool ordinal，再切掉 backing 的 layer 轴。本 rank 的 Mamba 层共享请求的 slot 数字 7，但分别修改自己那一层的 `[7]`；TP/层切分时不要把它理解成跨 rank 的同一块物理行。这一层 view 和第 5 节的 metadata 合在一起，才是 mixer 完整的 state 输入。
 
 不要在此 wrapper 的 `forward_extend()` / `forward_decode()` 上下断点：它们 [明确抛 `NotImplementedError`](../../python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py#L974-L982)，Mamba-2 直接走 `forward()`。
 
@@ -996,7 +996,7 @@ MAMBA 的 [`cleanup_after_caching_req`](../../python/sglang/srt/mem_cache/unifie
 |---:|---|---|---|
 | 1 | [`init_next_round_input · L1390–L1490`](../../python/sglang/srt/managers/schedule_batch.py#L1390-L1490) | token-id `RadixKey`、`prefix_indices`、`cache_protected_len`、`mamba_pool_idx` | key 是 token id；hit 时可能已有 COW dst；新请求 miss 时通常没有 slot，chunk continuation/retracted request 可能已经持有 active slot |
 | 2 | [`MambaComponent.finalize_match_result_in_cache · L187–L216`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#L187-L216) | source/dst slot、`mamba_cow_src_index` | dst 与 source ID 不同；尚未发生 payload copy |
-| 3 | [`HybridReqToTokenPool.alloc · L1351–L1405`](../../python/sglang/srt/mem_cache/memory_pool.py#L1351-L1405) | row、`mapping[row]`、`mamba_needs_clear` | miss 分到 fresh slot；命中且已有 MAMBA value/COW destination 时不重复 alloc；无有效 MAMBA 初态时还需核对实际重算起点；mapping 与 Req 一致 |
+| 3 | [`HybridReqToTokenPool.alloc · L1426–L1481`](../../python/sglang/srt/mem_cache/memory_pool.py#L1426-L1481) | row、`mapping[row]`、`mamba_needs_clear` | miss 分到 fresh slot；命中且已有 MAMBA value/COW destination 时不重复 alloc；无有效 MAMBA 初态时还需核对实际重算起点；mapping 与 Req 一致 |
 | 4 | [`_collect_deferred_mamba_cow_and_clear · L2859–L2879`](../../python/sglang/srt/managers/schedule_batch.py#L2859-L2879) | clear/COW tensors | fresh 与 COW 互斥；source/destination 成对 |
 | 5 | [`_maybe_execute_deferred_mamba_cow_and_clear · L1678–L1724`](../../python/sglang/srt/model_executor/model_runner.py#L1678-L1724) | copy/zero 后的 state 签名 | 第一次 Mamba layer read 前，fresh 全零或 COW 内容相等且 pointer 不 alias |
 | 6 | [`Mamba2Metadata.prepare_mixed · L214–L324`](../../python/sglang/srt/layers/attention/mamba/mamba2_metadata.py#L214-L324) | `mamba_cache_indices`、`query_start_loc`、`num_prefills`、`num_decodes`、`has_initial_states` | row→slot 顺序与 batch rows 一致；prefix continuation 的 initial mask 正确 |

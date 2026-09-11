@@ -153,13 +153,13 @@ KV prefix 的已完成 slot 通常只读，多个请求可以共同引用；recu
 
 图里的 `r` 是 request row，`s` 是 Full/MLA token slot，`m` 是 recurrent state slot。三者不是同一个整数，也不要求相等。图中数字和 shape 是便于阅读的教学值；真正的 layer 数、slot 数和 dtype 由配置决定。
 
-图后立刻回到源码：`ReqKvInfo.req_pool_idx` 与 `mamba_pool_idx` 是请求级句柄（[`ReqKvInfo`](../../python/sglang/srt/managers/schedule_batch.py#848-877)）；`HybridReqToTokenPool.alloc()` 维护 row → state-slot 映射（[`alloc`](../../python/sglang/srt/mem_cache/memory_pool.py#1351-1401)）；`mamba2_layer_cache()` 再按 layer id 取出该层的 `conv/temporal` view（[`mamba2_layer_cache`](../../python/sglang/srt/mem_cache/memory_pool.py#1414-1426)）。树上的 FULL/MAMBA value 只是 token loc 与 state-slot handle，真正的 payload 仍在各自 pool（[`ComponentType`](../../python/sglang/srt/mem_cache/unified_cache/component_type.py#6-30)、[`MambaComponent.finalize_match_result_in_cache`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#187-216)）。
+图后立刻回到源码：`ReqKvInfo.req_pool_idx` 与 `mamba_pool_idx` 是请求级句柄（[`ReqKvInfo`](../../python/sglang/srt/managers/schedule_batch.py#848-877)）；`HybridReqToTokenPool.alloc()` 维护 row → state-slot 映射（[`alloc`](../../python/sglang/srt/mem_cache/memory_pool.py#1426-1481)）；`mamba2_layer_cache()` 再按 layer id 取出该层的 `conv/temporal` view（[`mamba2_layer_cache`](../../python/sglang/srt/mem_cache/memory_pool.py#1527-1528)）。树上的 FULL/MAMBA value 只是 token loc 与 state-slot handle，真正的 payload 仍在各自 pool（[`ComponentType`](../../python/sglang/srt/mem_cache/unified_cache/component_type.py#6-30)、[`MambaComponent.finalize_match_result_in_cache`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#187-216)）。
 
 接着看时间问题：**一个 active slot 在 prefill、decode、cache、fork 之间，哪几步会改变 payload，哪几步只改变 owner？** 下面这张 timeline 是主线的唯一执行图；状态名仍是本文的 debug 标签，不是源码里的 enum。`c=12`、`m=5` 等均为教学值，`CHECKPOINTED` 只在确实有可恢复 snapshot 且进入 `cache_*` 边界时成立。
 
 ![KDA state timeline：分配、prefill、两步 decode、cache 与 fork](assets/day07_kda_execution_timeline.svg)
 
-图后的源码映射按图中四段读：A 的 fresh `clear` 来自 [`HybridReqToTokenPool.alloc`](../../python/sglang/srt/mem_cache/memory_pool.py#1351-1401)，命中 prefix 的 `COW` 由 [`MambaComponent.finalize_match_result_in_cache`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#187-216) 预约，再由 forward 前 deferred mutation 执行（[`_maybe_execute_deferred_mamba_cow_and_clear`](../../python/sglang/srt/model_executor/model_runner.py#1678-1724)）；B 的 prefill 扫描对应 [`KDAAttnBackend.forward_extend`](../../python/sglang/srt/layers/attention/linear/kda_backend.py#693-828)；C/D 的同 slot 原地 decode 对应 [`KDAAttnBackend.forward_decode`](../../python/sglang/srt/layers/attention/linear/kda_backend.py#531-691)；E 的 tree 发布、请求释放和 eviction 对应 [`cache_unfinished_req/cache_finished_req`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#838-1048)、[`prepare_for_caching_req`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#529-606) 与 [`cleanup_after_caching_req`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#608-653)。图中虚线 fork 只表示 source/destination 的句柄关系，不表示共享可写 state。
+图后的源码映射按图中四段读：A 的 fresh `clear` 来自 [`HybridReqToTokenPool.alloc`](../../python/sglang/srt/mem_cache/memory_pool.py#1426-1481)，命中 prefix 的 `COW` 由 [`MambaComponent.finalize_match_result_in_cache`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#187-216) 预约，再由 forward 前 deferred mutation 执行（[`_maybe_execute_deferred_mamba_cow_and_clear`](../../python/sglang/srt/model_executor/model_runner.py#1678-1724)）；B 的 prefill 扫描对应 [`KDAAttnBackend.forward_extend`](../../python/sglang/srt/layers/attention/linear/kda_backend.py#693-828)；C/D 的同 slot 原地 decode 对应 [`KDAAttnBackend.forward_decode`](../../python/sglang/srt/layers/attention/linear/kda_backend.py#531-691)；E 的 tree 发布、请求释放和 eviction 对应 [`cache_unfinished_req/cache_finished_req`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#838-1048)、[`prepare_for_caching_req`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#529-606) 与 [`cleanup_after_caching_req`](../../python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py#608-653)。图中虚线 fork 只表示 source/destination 的句柄关系，不表示共享可写 state。
 
 `EXTEND`、`CHECKPOINTED` 的真实证据是下面这些 mutation，而不是某个 `req.state` 字段。
 
@@ -266,7 +266,7 @@ $$
 | `MambaPool.mamba_cache.temporal` | `[num_kda_layers, mamba_slots+1, ...]` 的 KDA recurrent matrix | KDA extend/decode kernel | 下一轮 KDA 或 checkpoint copy；server 常驻 |
 | `node.component_data[MAMBA].value` | 通常为长度 1 的 slot-handle tensor（不是 state bytes） | `prepare_for_caching_req()` / `commit_insert_component_data()` | prefix match/COW/eviction；tree entry 生命周期 |
 
-`ReqToTokenPool` 的 row 0 是 dummy，真实 row 从 1 开始，见 [ReqToTokenPool · L257–L337](../../python/sglang/srt/mem_cache/memory_pool.py#257-337)。`MambaPool` 同样给 slot 0 留 dummy；普通布局中 conv/temporal 的 `size + 1` 维度和初始化见 [MambaPool.__init__ · L499–L613](../../python/sglang/srt/mem_cache/memory_pool.py#499-613)，最终封装进 `self.mamba_cache` 的位置见 [memory_pool.py · L824–L861](../../python/sglang/srt/mem_cache/memory_pool.py#824-861)。
+`ReqToTokenPool` 的 row 0 是 dummy，真实 row 从 1 开始，见 [ReqToTokenPool · L270–L392](../../python/sglang/srt/mem_cache/memory_pool.py#270-392)。`MambaPool` 同样给 slot 0 留 dummy；普通布局中 conv/temporal 的 `size + 1` 维度和初始化见 [MambaPool.__init__ · L524–L614](../../python/sglang/srt/mem_cache/memory_pool.py#524-614)，最终封装进 `self.mamba_cache` 的位置见 [memory_pool.py · L859–L870](../../python/sglang/srt/mem_cache/memory_pool.py#859-870)。
 
 一个请求通常只持有一个 active slot 编号 $m$；layer 由 pool 的第一维另行选择。因此第 $l$ 个 KDA 层读写的是：
 
@@ -448,7 +448,7 @@ _req_inc_lock_ref() 对 last_node 加锁，见 [PrefillAdder._req_inc_lock_ref()
 - 否则从 mamba_allocator 分配一个 slot，并标记 mamba_needs_clear=True；
 - 最后把 req row → mamba slot 写入 req_index_to_mamba_index_mapping。
 
-代码见 [HybridReqToTokenPool.alloc() · L1349–L1401](../../python/sglang/srt/mem_cache/memory_pool.py#1349-1401)；Mamba slot 的 free-list 实现见 [MambaSlotAllocator · L30–L97](../../python/sglang/srt/mem_cache/allocator/mamba.py#30-97)。
+代码见 [HybridReqToTokenPool.alloc() · L1426–L1481](../../python/sglang/srt/mem_cache/memory_pool.py#1426-1481)；Mamba slot 的 free-list 实现见 [MambaSlotAllocator · L30–L88](../../python/sglang/srt/mem_cache/allocator/mamba.py#30-88)。
 
 可以把 materialize 后的地址关系写成：
 
@@ -477,7 +477,7 @@ if cow_src_indices:
 
 MambaPool.clear_slots() 和 copy_from() 会同时处理本 pool 中所有 KDA 层的 conv、temporal state，见 [clear_slots/copy_from() · L962–L1039](../../python/sglang/srt/mem_cache/memory_pool.py#962-1039)。
 
-这个阶段最容易误判的点是：mamba_pool_idx 可能是 virtual slot。调用物理 pool 的 copy/clear 前必须经过 translate_mamba_indices()；静态 pool 是 identity，unified pool 可能不是，见 [translate_mamba_indices() · L1403–L1412](../../python/sglang/srt/mem_cache/memory_pool.py#1403-1412)。
+这个阶段最容易误判的点是：mamba_pool_idx 可能是 virtual slot。调用物理 pool 的 copy/clear 前必须经过 translate_mamba_indices()；静态 pool 是 identity，unified pool 可能不是，见 [translate_mamba_indices() · L1508–L1514](../../python/sglang/srt/mem_cache/memory_pool.py#1508-1514)。
 
 ## 7. T3：MATERIALIZED → EXTEND，KDA 一次 forward 改了哪些 state
 
@@ -502,7 +502,7 @@ KDA backend 在 _forward_metadata() 中：
 
 见 [MambaAttnBackendBase._forward_metadata() · L114–L270](../../python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py#114-270)。
 
-row → Mamba slot 的 pool-side lookup 由 [get_mamba_indices()/mamba2_layer_cache() · L1403–L1426](../../python/sglang/srt/mem_cache/memory_pool.py#1403-1426) 提供；layer id 再映射到 MambaPool 的 layer 维，slot id 映射到第二维。
+row → Mamba slot 的 pool-side lookup 由 [get_mamba_indices()/mamba2_layer_cache() · L1483–L1528](../../python/sglang/srt/mem_cache/memory_pool.py#1483-1528) 提供；layer id 再映射到 MambaPool 的 layer 维，slot id 映射到第二维。
 
 所以进入 kernel 前至少应观察下面这组字段快照：
 
@@ -684,7 +684,7 @@ UnifiedRadixCache.cache_finished_req() 会：
 
 见 [cache_finished_req() · L838–L924](../../python/sglang/srt/mem_cache/unified_radix_cache.py#838-924)。
 
-Mamba finished 路径可能直接把 active slot 作为树的 checkpoint handle；如果树中已存在相同 MAMBA value，则 cleanup 会释放未被采用的 slot。普通 pool 的最终 active slot 释放见 [HybridReqToTokenPool.free_mamba_cache() · L1519–L1573](../../python/sglang/srt/mem_cache/memory_pool.py#1519-1573)。
+Mamba finished 路径可能直接把 active slot 作为树的 checkpoint handle；如果树中已存在相同 MAMBA value，则 cleanup 会释放未被采用的 slot。普通 pool 的最终 active slot 释放见 [HybridReqToTokenPool.free_mamba_cache() · L1655–L1714](../../python/sglang/srt/mem_cache/memory_pool.py#1655-1714)。
 
 ### 10.2 prefix fork 为什么一定需要 COW（mamba_component.py · L187–L216）
 
@@ -708,7 +708,7 @@ MAMBA 的 slot 释放和 FULL 的 token loc 释放是两条路径，不能只看
 
 ### 11.1 Python debugger 能看到什么
 
-第一次可以加 `--disable-cuda-graph`，让 Python 断点更稳定；若再加 `--disable-overlap-schedule`，调度时序会更直观，但这属于简化运行，之后还要用默认 overlap 路径复查一次。两个开关的定义见 [server_args.py · L885–L892](../../python/sglang/srt/server_args.py#885-892) 和 [L3945–L3950](../../python/sglang/srt/server_args.py#3945-3950)。
+第一次可以加 `--disable-cuda-graph`，让 Python 断点更稳定；若再加 `--disable-overlap-schedule`，调度时序会更直观，但这属于简化运行，之后还要用默认 overlap 路径复查一次。两个开关的字段定义见 [`exec_.py · L489–L493`](../../python/sglang/srt/arg_groups/fields/exec_.py#L489-L493) 和 [`schedule.py · L173–L179`](../../python/sglang/srt/arg_groups/fields/schedule.py#L173-L179)。
 
 Python debugger 能逐步看 scheduler、allocator、metadata 和 backend dispatch，不能像普通 Python 一样逐行进入 Triton GPU kernel。要验证 kernel 是否真的修改 state，可在 kernel 调用前保存一个很小的切片或 norm，在调用后同步 CUDA 再比较：
 
@@ -817,7 +817,7 @@ len(req.prefix_indices) >= req.kv.cache_protected_len - page_size + 1
 | KDA extend | [kda_backend.py#693-828](../../python/sglang/srt/layers/attention/linear/kda_backend.py#693-828) | [kda.py#1084-1195](../../python/sglang/kernels/ops/attention/fla/kda.py#1084-1195) |
 | chunk checkpoint | [scheduler.py#3342-3380](../../python/sglang/srt/managers/scheduler.py#3342-3380) | [unified_radix_cache.py#925-1048](../../python/sglang/srt/mem_cache/unified_radix_cache.py#925-1048) |
 | decode | [schedule_batch.py#3287-3344](../../python/sglang/srt/managers/schedule_batch.py#3287-3344) | [kda_backend.py#531-691](../../python/sglang/srt/layers/attention/linear/kda_backend.py#531-691) |
-| finish / free | [unified_radix_cache.py#838-924](../../python/sglang/srt/mem_cache/unified_radix_cache.py#838-924) | [memory_pool.py#1519-1573](../../python/sglang/srt/mem_cache/memory_pool.py#1519-1573) |
+| finish / free | [unified_radix_cache.py#838-924](../../python/sglang/srt/mem_cache/unified_radix_cache.py#838-924) | [memory_pool.py#1655-1714](../../python/sglang/srt/mem_cache/memory_pool.py#1655-1714) |
 | component coordinate | [registry.py#146-196](../../python/sglang/srt/mem_cache/registry.py#146-196) | [component_type.py#6-30](../../python/sglang/srt/mem_cache/unified_cache/component_type.py#6-30) |
 
 第一遍直接把上表从上往下读：先走 lookup/admission，再走 row 与 slot materialization，然后进入 KDA extend、checkpoint/rematch、decode，最后看 finish/free。第 2 节已有同一状态机的总览，这里不再维护另一张重复流程图。

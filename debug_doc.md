@@ -127,7 +127,7 @@
 | B-19 | [`qwen3.py:388`](python/sglang/srt/models/qwen3.py#L388) `Qwen3DecoderLayer.forward` | `hidden_states.shape`、`positions.shape`；条件用 `self.self_attn.attn.layer_id == self.self_attn.start_layer`，只看当前 rank 的第一层 | `self.self_attn` 与 `self.mlp` |
 | B-20 | [`radix_attention.py:157`](python/sglang/srt/layers/radix_attention.py#L157) `RadixAttention.forward` | `q/k/v` shape 和 `forward_batch`；这里不会再次查 radix tree | attention backend 的 extend/decode |
 | B-21 | [`flashinfer_backend.py:1290`](python/sglang/srt/layers/attention/flashinfer_backend.py#L1290) `forward_extend` | `forward_batch.out_cache_loc`、layer、`save_kv_cache`；当前 token 的写地址从这里进入 backend | `get_kv_buffer` / `set_kv_buffer` |
-| B-22 | [`memory_pool.py:2518`](python/sglang/srt/mem_cache/memory_pool.py#L2518) `MHATokenToKVPool.set_kv_buffer` | `layer_id`、`loc`、`k/v.shape`；这是 K/V 数值真正写入 physical pool 的位置 | FlashInfer wrapper 读取历史 |
+| B-22 | [`memory_pool.py:2530`](python/sglang/srt/mem_cache/memory_pool.py#L2530) `MHATokenToKVPool.set_kv_buffer` | `layer_id`、`loc`、`k/v.shape`；这是 K/V 数值真正写入 physical pool 的位置 | FlashInfer wrapper 读取历史 |
 | B-23 | [`kv_index_translator.py:365`](python/sglang/srt/mem_cache/kv_index_translator.py#L365) `index_table_for_batch` | `req_pool_indices`、`seq_lens`、kernel-facing read table；读表和写地址是两个方向 | wrapper/kernel |
 | B-24 | [`flashinfer_backend.py:1451`](python/sglang/srt/layers/attention/flashinfer_backend.py#L1451) `forward_decode` | decode 的 `out_cache_loc` 和每行追加位置；对比 B-21 的 packed extend | `set_kv_buffer` 后 decode wrapper |
 

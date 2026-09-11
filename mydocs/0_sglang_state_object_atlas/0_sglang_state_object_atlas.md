@@ -219,7 +219,7 @@ Scheduler.__init__
 
 ### 2.2 `ReqToTokenPool`：地址映射表，不是 K/V
 
-**入口 → 输出：** [ReqToTokenPool](../../python/sglang/srt/mem_cache/memory_pool.py#L257-L337) → `req_to_token[row, position] = loc`。
+**入口 → 输出：** [ReqToTokenPool](../../python/sglang/srt/mem_cache/memory_pool.py#L270-L392) → `req_to_token[row, position] = loc`。
 
 普通路径中它是 GPU `int32` Tensor，形状近似 `[请求行数 + 1, 最大上下文长度]`；第 0 行是 dummy，真实 row 从 1 开始。`free_slots` 是 CPU 侧可用 row 列表，`req_generation` 用来区分同一 row 的不同次使用。
 
@@ -233,7 +233,7 @@ req_to_token[row=3, :]（放哪）: [12, 13, 14, 15, 28]
 
 ### 2.3 allocator 与 physical pool：发地址和存数值是两件事
 
-**入口 → 输出：** [alloc_for_extend](../../python/sglang/srt/mem_cache/allocation.py#L282-L370) → allocator 发 loc/page；[MHATokenToKVPool](../../python/sglang/srt/mem_cache/memory_pool.py#L1809-L1931) → [set_kv_buffer](../../python/sglang/srt/mem_cache/memory_pool.py#L2381-L2460) 按 loc 写入每层 K/V。
+**入口 → 输出：** [alloc_for_extend](../../python/sglang/srt/mem_cache/allocation.py#L282-L370) → allocator 发 loc/page；[MHATokenToKVPool](../../python/sglang/srt/mem_cache/memory_pool.py#L1954-L3071) → [set_kv_buffer](../../python/sglang/srt/mem_cache/memory_pool.py#L2530-L2908) 按 loc 写入每层 K/V。
 
 | 对象 | 管什么 | 典型输出 | 不要误解为 |
 | --- | --- | --- | --- |
@@ -344,7 +344,7 @@ A 的 row 恰好等于 page 3 只是示例巧合。row、page ID、flat loc 和 
 
 ### 5.3 Mamba / Linear Attention
 
-这条路径把寻址粒度从“每个历史 token 的 loc”换成“每条序列的 state slot”：[HybridReqToTokenPool](../../python/sglang/srt/mem_cache/memory_pool.py#L1193-L1408) 维护 row→slot 映射，[MambaSlotAllocator](../../python/sglang/srt/mem_cache/allocator/mamba.py#L30-L97) 分配 slot，[MambaPool](../../python/sglang/srt/mem_cache/memory_pool.py#L371-L414) 保存 state。row 3 和 slot 9 可以同时存在，但不能互当地址。
+这条路径把寻址粒度从“每个历史 token 的 loc”换成“每条序列的 state slot”：[HybridReqToTokenPool](../../python/sglang/srt/mem_cache/memory_pool.py#L1216-L1730) 维护 row→slot 映射，[MambaSlotAllocator](../../python/sglang/srt/mem_cache/allocator/mamba.py#L30-L88) 分配 slot，[MambaPool](../../python/sglang/srt/mem_cache/memory_pool.py#L393-L1215) 保存 state。row 3 和 slot 9 可以同时存在，但不能互当地址。
 
 ### 5.4 `draft_worker` 到底是什么
 

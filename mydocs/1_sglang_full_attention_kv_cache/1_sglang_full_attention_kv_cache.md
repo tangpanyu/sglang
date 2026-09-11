@@ -207,7 +207,7 @@ def alloc_memory_pool(self, memory_pool_config=None):
 - 这一段看什么：`req_to_token` 的 shape、dummy row、`alloc_rows/free_rows`。
 - 下一跳：`allocation.write_cache_indices()` 把 prefix 和新 slot 写入这张表。
 
-源码在[`ReqToTokenPool`](../../python/sglang/srt/mem_cache/memory_pool.py#257-337)：
+源码在[`ReqToTokenPool`](../../python/sglang/srt/mem_cache/memory_pool.py#270-392)：
 
 ```python
 # memory_pool.py#273-283
@@ -242,7 +242,7 @@ K_l\in\mathbb{R}^{(\mathrm{size}+\mathrm{page\_size})\times H_{kv}\times D_k},
 V_l\in\mathbb{R}^{(\mathrm{size}+\mathrm{page\_size})\times H_{kv}\times D_v}.
 $$
 
-对应源码 `_kv_buffer_shapes()` 的返回值是 `(rows, head_num, head_dim)` 和 `(rows, head_num, v_head_dim)`，其中 `rows=size+page_size`：[`memory_pool.py#2099-2110`](../../python/sglang/srt/mem_cache/memory_pool.py#2099-2110)。buffer 的实际创建在[`#2112-2163`](../../python/sglang/srt/mem_cache/memory_pool.py#2112-2163)。
+对应源码 `_kv_buffer_shapes()` 的返回值是 `(rows, head_num, head_dim)` 和 `(rows, head_num, v_head_dim)`，其中 `rows=size+page_size`：[`memory_pool.py#2246-2257`](../../python/sglang/srt/mem_cache/memory_pool.py#2246-2257)。buffer 的实际创建在[`#2259-2310`](../../python/sglang/srt/mem_cache/memory_pool.py#2259-2310)。
 
 这里的第一维不是某条请求的长度，而是全局可寻址的 slot 行。第二维是当前 TP rank 负责的 KV heads，最后一维是每个 head 的维度；`layer_num` 则让 pool 为每个有效 layer 各持有一对 K/V buffer。因此同一个 `loc=17` 在不同 layer 中代表不同的一行数值，但在同一 layer 内，K 和 V 共享这个 slot 坐标。
 
@@ -255,7 +255,7 @@ $$
 写入接口的关键契约是：
 
 ```python
-# memory_pool.py#2381-2460，压缩展示
+# memory_pool.py#2530-2908，压缩展示
 def set_kv_buffer(
     self,
     layer,
@@ -275,7 +275,7 @@ def set_kv_buffer(
     self._store_kv_layer(layer_id - self.start_layer, loc, cache_k, cache_v)
 ```
 
-它只关心 `loc`、当前层和 K/V 数值，不知道 token hash、radix node 或请求锁。完整实现见[`MHATokenToKVPool.set_kv_buffer`](../../python/sglang/srt/mem_cache/memory_pool.py#2381-2460)。
+它只关心 `loc`、当前层和 K/V 数值，不知道 token hash、radix node 或请求锁。完整实现见[`MHATokenToKVPool.set_kv_buffer`](../../python/sglang/srt/mem_cache/memory_pool.py#2530-2908)。
 
 **带读。** `unwrap_write_loc()` 只是把 backend 可能携带的附加定位信息拆出真正的 `loc`；随后 `layer_id` 决定写哪一对 per-layer buffer，最后 `_store_kv_layer()` 才执行物理写入。注意这里完全没有 token ID 匹配或树操作，所以它只能消费上游已经准备好的地址。下一段的 allocator 正是这些地址的生产者。
 
@@ -718,7 +718,7 @@ slot 不够时，[`alloc_token_slots`](../../python/sglang/srt/mem_cache/allocat
 1. [`Scheduler.__init__`](../../python/sglang/srt/managers/scheduler.py#548-559) → [`init_model_worker`](../../python/sglang/srt/managers/scheduler.py#1047-1060) → [`init_memory_pools`](../../python/sglang/srt/managers/scheduler.py#1020-1033)；
 2. [`init_target_memory_pool`](../../python/sglang/srt/managers/scheduler.py#1006-1018) → [`TpModelWorker.alloc_memory_pool`](../../python/sglang/srt/managers/tp_worker.py#407-433)；
 3. [`ModelRunner.alloc_memory_pool`](../../python/sglang/srt/model_executor/model_runner.py#881-903) → [`KVCacheConfigurator.configure`](../../python/sglang/srt/mem_cache/kv_cache_configurator.py#296-329)；
-4. [`MHATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#1809-1931) 与 [`ReqToTokenPool`](../../python/sglang/srt/mem_cache/memory_pool.py#257-337)；
+4. [`MHATokenToKVPool`](../../python/sglang/srt/mem_cache/memory_pool.py#1954-3071) 与 [`ReqToTokenPool`](../../python/sglang/srt/mem_cache/memory_pool.py#270-392)；
 5. [`TokenToKVPoolAllocator.alloc`](../../python/sglang/srt/mem_cache/allocator/token.py#28-75)；
 6. [`Req.init_next_round_input`](../../python/sglang/srt/managers/schedule_batch.py#1390-1490) → [`UnifiedRadixCache.match_prefix`](../../python/sglang/srt/mem_cache/unified_radix_cache.py#523-539)；
 7. [`ScheduleBatch.prepare_for_extend`](../../python/sglang/srt/managers/schedule_batch.py#2504-2552) → [`alloc_for_extend`](../../python/sglang/srt/mem_cache/allocation.py#282-389)；
