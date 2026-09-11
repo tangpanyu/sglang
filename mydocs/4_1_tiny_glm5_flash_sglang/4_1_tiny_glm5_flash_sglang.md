@@ -556,7 +556,7 @@ $L=68$ 跨越两个 main KV page，最后一个 prefill query 可见 17 个完�
 - $L=8$ smoke 仍只能证明 all-visible 路径；$L=68$ smoke 和 [`test_small_group_topk_uses_torch_fallback`](../../test/registered/kernels/test_dsa_kpool_multi_pool.py#46-74) 才覆盖真正 pool score top-k；
 - 小 `group_topk` fallback 要求 CUDA `float32 logits`，且不支持只在 fused fast path 才使用的 `page_table_row_index`；
 - SM120 eager sparse fallback 是可读参考实现，不是 GLM-5.3-Flash 的真实 kernel；
-- SM86 的 SGLang DSA runner 已按 BF16 + Torch/FA3 路径适配；未在当前无 Ampere GPU 的环境中做真实设备 smoke；
+- A100/SM80 与 SM86 的 SGLang DSA runner 都已按 BF16 + Torch/FA3 路径适配；未在当前无 Ampere GPU 的环境中做真实设备 smoke；
 - 当前没有把 tiny model 注册成正式的 GLM-5 模型，也没有修改原始 GLM registry。
 
-如果继续完善 SM86，优先应在真实 A100/SM86 机器上做性能和数值 smoke，重点观察 DSA backend 的三层：`indexer score`、`paged KV gather`、`selected-token attention`。KDA、mHC、MoE 和四层 schedule 不需要再复制一套模型结构。
+如果继续完善 Ampere 路径，优先应分别在真实 A100/SM80 和 SM86 机器上做性能和数值 smoke，重点观察 DSA backend 的三层：`indexer score`、`paged KV gather`、`selected-token attention`。KDA、mHC、MoE 和四层 schedule 不需要再复制一套模型结构。
